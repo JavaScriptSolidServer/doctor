@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>doctor — Solid pod diagnostics</title>
+  <link rel="stylesheet" href="doctor.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>doctor</h1>
+      <p class="tagline">Diagnostics for Solid pods and the decentralized-web stack.</p>
+    </header>
+
+    <section class="checker">
+      <h2>LWS / CID v1 profile shape</h2>
+      <p>Enter a WebID URL. The checker fetches it as <code>application/ld+json</code> and validates against the
+        <a href="https://www.w3.org/TR/cid-1.0/" target="_blank" rel="noopener">W3C Controlled Identifiers v1.0</a>
+        profile expected by
+        <a href="https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/" target="_blank" rel="noopener">LWS 1.0 auth</a>.</p>
+
+      <form id="check-form">
+        <label for="webid">WebID URL</label>
+        <input id="webid" name="webid" type="url" required
+               placeholder="https://alice.solid.social/profile/card.jsonld#me"
+               value="">
+        <button type="submit">Run diagnostics</button>
+      </form>
+
+      <div id="results" hidden>
+        <h3>Results</h3>
+        <ol id="checks" class="checks"></ol>
+
+        <details id="raw">
+          <summary>Raw profile JSON</summary>
+          <pre id="raw-body"></pre>
+        </details>
+      </div>
+    </section>
+
+    <footer>
+      <p>
+        <a href="https://github.com/JavaScriptSolidServer/doctor" target="_blank" rel="noopener">source</a>
+        · <a href="https://github.com/JavaScriptSolidServer/doctor/issues" target="_blank" rel="noopener">issues</a>
+        · alpha
+      </p>
+    </footer>
+  </main>
+
+  <script type="module" src="doctor.js"></script>
+</body>
+</html>
