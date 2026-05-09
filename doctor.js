@@ -8,7 +8,7 @@
  * no auth — just a read. The output is a green/yellow/red checklist.
  */
 
-import { runLwsCidChecks } from './lib/lws-cid.js';
+import { runLwsCidChecks, normalizeControllers } from './lib/lws-cid.js';
 import { buildNostrVerificationMethod } from './lib/multikey.js';
 
 const form     = document.getElementById('check-form');
@@ -31,6 +31,7 @@ const copyStatus     = document.getElementById('copy-status');
 
 let lastWebId = null;
 let lastDocUrl = null;
+let lastController = null;
 
 // Allow ?webid=… in the URL to pre-fill (handy for sharing / bookmarks).
 const params = new URLSearchParams(window.location.search);
@@ -58,11 +59,12 @@ form.addEventListener('submit', async (e) => {
   hideAddKeySection();
 
   try {
-    const { checks, profileFetched, webId, docUrl } = await runAll(url);
+    const { checks, profileFetched, webId, docUrl, controller } = await runAll(url);
     renderChecks(checks);
     if (profileFetched && webId) {
       lastWebId = webId;
       lastDocUrl = docUrl;
+      lastController = controller;
       revealAddKeySection();
     } else {
       hideAddKeySection();
@@ -82,7 +84,7 @@ form.addEventListener('submit', async (e) => {
 
 async function runAll(webIdUrl) {
   const checks = [];
-  const result = { checks, profileFetched: false, docUrl: null, webId: null };
+  const result = { checks, profileFetched: false, docUrl: null, webId: null, controller: null };
 
   // 1. Resolve the document URL — strip the fragment.
   let docUrl;
@@ -174,9 +176,18 @@ async function runAll(webIdUrl) {
       // malformed @id; fall through to user-supplied URL
     }
   }
+  // Derive the controller IRI from the profile's declared `controller`
+  // (handling all four JSON-LD shapes), falling back to the canonical
+  // WebID when controller is absent. Generated VMs use this so that on
+  // delegated-control profiles the snippet matches the profile's own
+  // controller predicate (and passes the validator).
+  const declaredCtrls = normalizeControllers(profile.controller, docUrl.toString());
+  const controllerIri = declaredCtrls[0] ?? canonicalWebId;
+
   result.profileFetched = true;
   result.docUrl = docUrl.toString();
   result.webId = canonicalWebId;
+  result.controller = controllerIri;
 
   // 4. Run LWS-CID structural checks.
   for (const c of runLwsCidChecks(profile, { webIdUrl })) {
@@ -202,6 +213,7 @@ function hideAddKeySection() {
   clearSignerOutput();
   lastWebId = null;
   lastDocUrl = null;
+  lastController = null;
 }
 
 function clearSignerOutput() {
@@ -250,7 +262,7 @@ connectButton.addEventListener('click', async () => {
     if (!/^[0-9a-f]{64}$/i.test(xOnlyHex)) {
       throw new Error(`Signer returned an unexpected pubkey: ${xOnlyHex}`);
     }
-    renderSnippet(xOnlyHex, lastWebId, lastDocUrl);
+    renderSnippet(xOnlyHex, lastWebId, lastDocUrl, lastController);
     signerOutput.hidden = false;
     setSignerStatus('ready', 'Connected. The snippet below is ready to paste into your profile.');
     connectButton.textContent = 'Reconnect signer';
@@ -262,8 +274,8 @@ connectButton.addEventListener('click', async () => {
   }
 });
 
-function renderSnippet(xOnlyHex, webId, docUrl) {
-  const vm = buildNostrVerificationMethod({ webId, xOnlyHex });
+function renderSnippet(xOnlyHex, webId, docUrl, controller) {
+  const vm = buildNostrVerificationMethod({ webId, xOnlyHex, controller });
   pubkeyHexEl.textContent = xOnlyHex;
   pubkeyMbEl.textContent  = vm.publicKeyMultibase;
   // Write target is the document URL (no fragment) — you can't PUT/PATCH
