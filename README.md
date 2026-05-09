@@ -30,7 +30,7 @@ Read-only — no auth, no mutations, no server roundtrip beyond the GETs.
 
 - ~~**B.0**~~ — Read-only LWS-CID profile validator ✅
 - ~~**B.2**~~ — Read pubkey from NIP-07 signer; emit Multikey verificationMethod snippet ✅
-- ~~**B.3**~~ — Strict LWS10-CID auth: Solid-OIDC sign-in, ES256K `JsonWebKey` VM PATCHed into profile, sign real JWTs to authenticate ✅
+- ~~**B.3**~~ — Strict LWS10-CID auth: Solid-OIDC sign-in, ES256K `JsonWebKey` VM written into profile (GET → merge → PUT with `If-Match`), sign real JWTs to authenticate ✅
 - **B.1** — Bidirectional `alsoKnownAs` ↔ DID-doc check (resolve `did:nostr:…` and verify the DID points back at this WebID)
 - **B.4** — did:key + WebAuthn passkey verification methods
 - **B.5** — More diagnostics: ACL inheritance, type-index integrity, OIDC discovery, ActivityPub actor doc, …

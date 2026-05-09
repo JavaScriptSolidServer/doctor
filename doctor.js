@@ -386,7 +386,11 @@ function revealLwsAuthSection() {
   lwsAuthSection.hidden = false;
   // Only enable sign-in if we have an issuer to point at.
   oidcSignInBtn.disabled = !lastIssuer;
-  if (!lastIssuer) {
+  // If a session was restored from IndexedDB the user is already
+  // authenticated — don't clobber the signed-in status with a
+  // pre-login warning. The "no issuer" message only matters before
+  // we have a session.
+  if (!lastIssuer && !session.isActive) {
     setOidcStatus('error',
       'Profile declares no oidcIssuer — cannot start a Solid-OIDC sign-in.');
   }
@@ -558,9 +562,12 @@ function chooseFragmentAndBuildVm({ privKey, profile, webId, controller }) {
             : profile.verificationMethod ? [profile.verificationMethod]
             : [];
 
-  // Pre-build the VM once so we can compare its JWK against existing
+  // Pre-build a VM once so we can compare its JWK against existing
   // entries. The fragment will be re-stamped on the chosen one below.
+  // (buildEs256kVerificationMethod returns { vm, jwk, kid } — the JWK
+  // sits on .jwk, not .publicKeyJwk.)
   const probe = buildEs256kVerificationMethod({ privKey, webId, controller, fragment: 'probe' });
+  const probeJwk = probe.jwk;
 
   for (let n = 1; n <= 99; n++) {
     const candidateId = `${docUrl}#lws-key-${n}`;
@@ -575,7 +582,7 @@ function chooseFragmentAndBuildVm({ privKey, profile, webId, controller }) {
     // public-key material (idempotent re-run).
     if (typeof existing === 'object' && existing !== null) {
       const existingJwk = existing.publicKeyJwk;
-      if (existingJwk && sameJwk(existingJwk, probe.publicKeyJwk)) {
+      if (existingJwk && sameJwk(existingJwk, probeJwk)) {
         const result = buildEs256kVerificationMethod({
           privKey, webId, controller, fragment: `lws-key-${n}`,
         });
