@@ -38,6 +38,21 @@ let lastIssuer = null;
 let lastVmKid = null;
 let memPrivKey = null; // 32-byte secp256k1 privkey, in-memory only
 
+/**
+ * Zero out + drop the in-memory privkey. JS gives us no real memory
+ * clearing — once we release a Uint8Array reference, the previous
+ * bytes hang around in the heap until GC. But we own this buffer, so
+ * overwriting in place at least removes the secret from anything we
+ * still hold, which is meaningful for a multi-step UI flow where the
+ * key sits around between PATCH and Test.
+ */
+function clearMemPrivKey() {
+  if (memPrivKey) {
+    try { memPrivKey.fill(0); } catch { /* not a Uint8Array — fine */ }
+  }
+  memPrivKey = null;
+}
+
 // Allow ?webid=… in the URL to pre-fill (handy for sharing / bookmarks).
 const params = new URLSearchParams(window.location.search);
 if (params.has('webid')) {
@@ -358,7 +373,7 @@ const session = new Session({
       // ends. The UI promises sign-out clears state, and a privkey
       // sitting in a tab that's no longer authenticated is just
       // exposure with no purpose.
-      memPrivKey = null;
+      clearMemPrivKey();
       lastVmKid = null;
       privkeyInput.value = '';
       testSection.hidden = true;
@@ -403,7 +418,7 @@ function hideLwsAuthSection() {
   testResult.textContent = '';
   testResult.className = 'test-result';
   testSection.hidden = true;
-  memPrivKey = null;
+  clearMemPrivKey();
   lastVmKid = null;
   // Clear the input element too — the in-memory privkey is gone but a
   // pasted value would otherwise persist in the DOM across diagnostic
@@ -453,7 +468,23 @@ patchButton.addEventListener('click', async () => {
     });
     if (!getRes.ok) throw new Error(`GET profile: HTTP ${getRes.status}`);
     const etag = getRes.headers.get('etag');
-    const current = await getRes.json();
+    // Validate Content-Type before JSON.parse so a Turtle (or HTML
+    // error page) response gives a clear actionable message rather
+    // than a generic "Unexpected token in JSON" SyntaxError.
+    const ct = (getRes.headers.get('content-type') || '').toLowerCase();
+    const body = await getRes.text();
+    if (!ct.includes('json')) {
+      throw new Error(
+        `profile GET returned Content-Type "${ct || '(none)'}" — expected JSON-LD. ` +
+        `First bytes: ${body.slice(0, 80).replace(/\s+/g, ' ')}`,
+      );
+    }
+    let current;
+    try {
+      current = JSON.parse(body);
+    } catch (err) {
+      throw new Error(`profile body is not valid JSON: ${err.message}`);
+    }
 
     // Pick a fragment that's either unused or already holds the same
     // key (idempotent re-run). Re-running with a different key won't
@@ -501,7 +532,7 @@ patchButton.addEventListener('click', async () => {
     // Otherwise a UI that already showed the test section from a
     // prior successful run would still claim "ready to test" with a
     // stale kid against a now-uncertain server state.
-    memPrivKey = null;
+    clearMemPrivKey();
     lastVmKid = null;
     testSection.hidden = true;
     testResult.textContent = '';
