@@ -153,6 +153,17 @@ async function runAll(webIdUrl) {
     });
     return result;
   }
+  // JSON.parse accepts null, primitives, and arrays — none of which are
+  // a usable JSON-LD profile document. Bail out before downstream code
+  // tries to read `@id`/`controller` and throws.
+  if (profile === null || typeof profile !== 'object' || Array.isArray(profile)) {
+    checks.push({
+      status: 'fail',
+      label: 'Profile parses as JSON',
+      detail: `Top-level value is ${profile === null ? 'null' : Array.isArray(profile) ? 'an array' : typeof profile}; expected a JSON object.`,
+    });
+    return result;
+  }
   checks.push({ status: 'pass', label: 'Profile parses as JSON' });
 
   // Profile was fetched and parsed — safe to root a snippet against this URL.
