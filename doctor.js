@@ -497,7 +497,15 @@ patchButton.addEventListener('click', async () => {
   } catch (err) {
     patchResult.className = 'patch-result error';
     patchResult.textContent = `Failed: ${err.message || err}`;
+    // Reset everything that depended on the patch having succeeded.
+    // Otherwise a UI that already showed the test section from a
+    // prior successful run would still claim "ready to test" with a
+    // stale kid against a now-uncertain server state.
     memPrivKey = null;
+    lastVmKid = null;
+    testSection.hidden = true;
+    testResult.textContent = '';
+    testResult.className = 'test-result';
   }
 });
 
@@ -576,7 +584,7 @@ function chooseFragmentAndBuildVm({ privKey, profile, webId, controller }) {
 
   for (let n = 1; n <= 99; n++) {
     const candidateId = `${docUrl}#lws-key-${n}`;
-    const existing = vms.find((v) => entryMatchesId(v, candidateId));
+    const existing = vms.find((v) => entryMatchesId(v, candidateId, docUrl));
     if (!existing) {
       const result = buildEs256kVerificationMethod({
         privKey, webId, controller, fragment: `lws-key-${n}`,
@@ -615,10 +623,11 @@ function chooseFragmentAndBuildVm({ privKey, profile, webId, controller }) {
  */
 function mergeVerificationMethod(profile, vm) {
   const out = { ...profile };
+  const baseUrl = stripHashLocal(vm.id);
   const vms = Array.isArray(out.verificationMethod) ? [...out.verificationMethod]
             : out.verificationMethod ? [out.verificationMethod]
             : [];
-  const idx = vms.findIndex((v) => entryMatchesId(v, vm.id));
+  const idx = vms.findIndex((v) => entryMatchesId(v, vm.id, baseUrl));
   if (idx >= 0) vms[idx] = vm;
   else vms.push(vm);
   out.verificationMethod = vms;
@@ -626,17 +635,36 @@ function mergeVerificationMethod(profile, vm) {
   const auth = Array.isArray(out.authentication) ? [...out.authentication]
              : out.authentication ? [out.authentication]
              : [];
-  if (!auth.some((a) => (typeof a === 'string' ? a : a?.['@id'] || a?.id) === vm.id)) {
-    auth.push(vm.id);
-  }
+  // De-dupe against the absolutized form so a pre-existing relative
+  // entry like "#lws-key-1" is recognized as the same as the absolute
+  // URI we're about to push.
+  const exists = auth.some((a) => {
+    const raw = typeof a === 'string' ? a : (a?.['@id'] || a?.id);
+    if (typeof raw !== 'string') return false;
+    return absolutizeLocal(raw, baseUrl) === vm.id;
+  });
+  if (!exists) auth.push(vm.id);
   out.authentication = auth;
   return out;
 }
 
-function entryMatchesId(entry, id) {
-  if (typeof entry === 'string') return entry === id;
-  if (entry && typeof entry === 'object') return (entry.id || entry['@id']) === id;
+function entryMatchesId(entry, id, baseUrl) {
+  // Handle relative IRIs the way JSON-LD does: resolve against the
+  // document URL before comparing. This lets us recognize existing
+  // entries written as "#lws-key-1" as equivalent to the absolute
+  // form we generate.
+  const resolve = (s) => (typeof s === 'string' ? absolutizeLocal(s, baseUrl) : s);
+  if (typeof entry === 'string') return resolve(entry) === resolve(id);
+  if (entry && typeof entry === 'object') {
+    const raw = entry.id || entry['@id'];
+    return typeof raw === 'string' && resolve(raw) === resolve(id);
+  }
   return false;
+}
+
+function absolutizeLocal(u, base) {
+  if (!u) return u;
+  try { return new URL(u, base).toString(); } catch { return u; }
 }
 
 function sameJwk(a, b) {
