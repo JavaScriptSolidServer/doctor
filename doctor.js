@@ -53,16 +53,21 @@ form.addEventListener('submit', async (e) => {
   results.hidden = false;
 
   try {
-    const checks = await runAll(url);
+    const { checks, profileFetched, docUrl } = await runAll(url);
     renderChecks(checks);
-    lastWebId = url;
-    revealAddKeySection();
+    if (profileFetched && docUrl) {
+      lastWebId = docUrl;
+      revealAddKeySection();
+    } else {
+      hideAddKeySection();
+    }
   } catch (err) {
     renderChecks([{
       status: 'fail',
       label: 'Diagnostics crashed',
       detail: String(err?.message || err),
     }]);
+    hideAddKeySection();
   } finally {
     button.disabled = false;
     button.textContent = 'Run diagnostics';
@@ -71,6 +76,7 @@ form.addEventListener('submit', async (e) => {
 
 async function runAll(webIdUrl) {
   const checks = [];
+  const result = { checks, profileFetched: false, docUrl: null };
 
   // 1. Resolve the document URL — strip the fragment.
   let docUrl;
@@ -79,14 +85,14 @@ async function runAll(webIdUrl) {
     docUrl.hash = '';
   } catch (err) {
     checks.push({ status: 'fail', label: 'WebID is a valid URL', detail: err.message });
-    return checks;
+    return result;
   }
   checks.push({ status: 'pass', label: 'WebID is a valid URL', detail: docUrl.toString() });
 
   // 2. Fetch as JSON-LD. We avoid Accept: text/turtle so the conneg layer
   //    doesn't transform the document — we want to validate the JSON-LD
   //    representation directly.
-  let res, body, contentType;
+  let res, contentType;
   try {
     res = await fetch(docUrl.toString(), {
       headers: { 'Accept': 'application/ld+json' },
@@ -94,7 +100,7 @@ async function runAll(webIdUrl) {
     contentType = (res.headers.get('content-type') || '').toLowerCase();
   } catch (err) {
     checks.push({ status: 'fail', label: 'Profile is reachable', detail: err.message });
-    return checks;
+    return result;
   }
 
   if (!res.ok) {
@@ -103,7 +109,7 @@ async function runAll(webIdUrl) {
       label: 'Profile is reachable',
       detail: `HTTP ${res.status} from ${docUrl}`,
     });
-    return checks;
+    return result;
   }
   checks.push({
     status: 'pass',
@@ -137,16 +143,20 @@ async function runAll(webIdUrl) {
       label: 'Profile parses as JSON',
       detail: err.message,
     });
-    return checks;
+    return result;
   }
   checks.push({ status: 'pass', label: 'Profile parses as JSON' });
+
+  // Profile was fetched and parsed — safe to root a snippet against this URL.
+  result.profileFetched = true;
+  result.docUrl = docUrl.toString();
 
   // 4. Run LWS-CID structural checks.
   for (const c of runLwsCidChecks(profile, { webIdUrl, docUrl: docUrl.toString() })) {
     checks.push(c);
   }
 
-  return checks;
+  return result;
 }
 
 // --- B.2: connect Nostr signer & compute Multikey VM -----------------
@@ -154,6 +164,24 @@ async function runAll(webIdUrl) {
 function revealAddKeySection() {
   addKeySection.hidden = false;
   detectSigner();
+}
+
+function hideAddKeySection() {
+  addKeySection.hidden = true;
+  signerOutput.hidden = true;
+  pubkeyHexEl.textContent = '';
+  pubkeyMbEl.textContent = '';
+  snippetEl.textContent = '';
+  snippetTarget.textContent = '';
+  lastWebId = null;
+}
+
+function clearSignerOutput() {
+  signerOutput.hidden = true;
+  pubkeyHexEl.textContent = '';
+  pubkeyMbEl.textContent = '';
+  snippetEl.textContent = '';
+  snippetTarget.textContent = '';
 }
 
 function detectSigner() {
@@ -185,6 +213,7 @@ connectButton.addEventListener('click', async () => {
     signerOutput.hidden = false;
     setSignerStatus('ready', 'Connected. The snippet below is ready to paste into your profile.');
   } catch (err) {
+    clearSignerOutput();
     setSignerStatus('error', `Could not read pubkey: ${err.message || err}`);
   } finally {
     connectButton.textContent = 'Reconnect signer';
