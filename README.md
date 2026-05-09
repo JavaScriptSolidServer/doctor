@@ -15,7 +15,7 @@ A diagnostic tool for [Solid](https://solidproject.org/) pods and the surroundin
 - `controller === @id` (CID v1 self-control contract)?
 - `verificationMethod` populated?
   - Each entry has `id`, `type`, `controller`, and either `publicKeyJwk` or `publicKeyMultibase`?
-  - `controller` of each method matches the WebID?
+  - Each method's `controller` matches the profile's declared `controller` (with fallback to `@id` when `controller` is absent), so delegated-control profiles validate correctly?
   - `id` values unique?
 - `authentication` entries point at real verificationMethods?
 - `alsoKnownAs` entries are DID URIs?

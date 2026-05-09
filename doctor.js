@@ -233,6 +233,16 @@ function setSignerStatus(state, text) {
 
 connectButton.addEventListener('click', async () => {
   if (!lastWebId) return;
+  // Re-check presence: a NIP-07 provider can be uninstalled or
+  // disabled between detection and click. Throwing a raw TypeError
+  // from `window.nostr.getPublicKey()` would surface a confusing
+  // error.
+  if (typeof window.nostr?.getPublicKey !== 'function') {
+    setSignerStatus('absent',
+      'No NIP-07 signer found. Install xlogin or another window.nostr provider, then reload.');
+    connectButton.disabled = true;
+    return;
+  }
   connectButton.disabled = true;
   connectButton.textContent = 'Connecting…';
   try {
