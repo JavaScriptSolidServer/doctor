@@ -151,14 +151,25 @@ async function runAll(webIdUrl) {
 
   // Profile was fetched and parsed — safe to root a snippet against this URL.
   // Take the canonical WebID from the profile's own @id (absolutized
-  // against the document URL); fall back to the user-supplied URL if
-  // the profile didn't declare one. This preserves any fragment (e.g.
-  // "#me") so verificationMethod controllers will agree with the
-  // profile's outer controller predicate.
+  // against the document URL), but only when its fragmentless form
+  // matches the URL we actually fetched — otherwise the snippet's VM
+  // id would be rooted at one document while the UI tells the user to
+  // patch a different one. Untrusted input, so the URL parse is
+  // wrapped: malformed @id falls back to the user-supplied URL.
   const profileId = profile['@id'] || profile.id;
-  const canonicalWebId = profileId
-    ? new URL(profileId, docUrl).toString()
-    : webIdUrl;
+  let canonicalWebId = webIdUrl;
+  if (profileId) {
+    try {
+      const resolved = new URL(profileId, docUrl);
+      const resolvedNoHash = new URL(resolved);
+      resolvedNoHash.hash = '';
+      if (resolvedNoHash.toString() === docUrl.toString()) {
+        canonicalWebId = resolved.toString();
+      }
+    } catch {
+      // malformed @id; fall through to user-supplied URL
+    }
+  }
   result.profileFetched = true;
   result.docUrl = docUrl.toString();
   result.webId = canonicalWebId;
