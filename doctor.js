@@ -405,6 +405,11 @@ function hideLwsAuthSection() {
   testSection.hidden = true;
   memPrivKey = null;
   lastVmKid = null;
+  // Clear the input element too — the in-memory privkey is gone but a
+  // pasted value would otherwise persist in the DOM across diagnostic
+  // re-runs / WebID switches and could be accidentally reused on a
+  // different identity.
+  privkeyInput.value = '';
 }
 
 oidcSignInBtn.addEventListener('click', async () => {
