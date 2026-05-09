@@ -193,6 +193,7 @@ function clearSignerOutput() {
   snippetTarget.textContent = '';
   connectButton.textContent = 'Connect signer';
   copyStatus.textContent = '';
+  copyStatus.className = 'copy-status';
 }
 
 function detectSigner() {
@@ -255,11 +256,16 @@ function renderSnippet(xOnlyHex, webId, docUrl) {
 copyButton.addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText(snippetEl.textContent);
+    copyStatus.className = 'copy-status success';
     copyStatus.textContent = 'Copied.';
   } catch (err) {
+    copyStatus.className = 'copy-status error';
     copyStatus.textContent = `Couldn't copy: ${err.message || err}`;
   }
-  setTimeout(() => { copyStatus.textContent = ''; }, 2500);
+  setTimeout(() => {
+    copyStatus.textContent = '';
+    copyStatus.className = 'copy-status';
+  }, 2500);
 });
 
 function renderChecks(checks) {
