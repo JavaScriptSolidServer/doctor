@@ -8,7 +8,7 @@ A diagnostic tool for [Solid](https://solidproject.org/) pods and the surroundin
 
 ## What it does today
 
-**1. LWS / CID v1 profile shape check** — drop in a WebID URL, get a green/red checklist of what's structurally there and what's missing for [LWS 1.0](https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/) auth conformance:
+**1. LWS / CID v1 profile shape check** — drop in a WebID URL, get a pass/warn/fail/skip checklist of what's structurally there and what's missing for [LWS 1.0](https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/) auth conformance:
 
 - Profile fetches as `application/ld+json`?
 - `@context` declares the CID v1 vocabulary (controller, verificationMethod, authentication, …)?
