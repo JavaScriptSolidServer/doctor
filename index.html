@@ -70,7 +70,54 @@
         <button type="button" id="copy-snippet">Copy snippet</button>
         <span class="copy-status" id="copy-status" aria-live="polite"></span>
 
-        <p class="hint future">B.3 will close the loop with an in-app PATCH so you don't need to copy/paste.</p>
+        <p class="hint">For end-to-end auth without copy/paste, see "Strict LWS10-CID auth setup" below — it signs you in, writes the VM, and tests authentication for you.</p>
+      </div>
+    </section>
+
+    <section class="lws-auth" id="lws-auth" hidden>
+      <h2>Strict LWS10-CID auth setup</h2>
+      <p>Sign in to your pod, paste a secp256k1 private key as 64 hex chars (the raw
+        32-byte key behind your Nostr <code>nsec1…</code> bech32 &mdash; same key,
+        different signature scheme), and the doctor adds a
+        <code>JsonWebKey</code> verificationMethod to your profile (read-modify-write over
+        authenticated GET + PUT) and signs a real
+        <a href="https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/" target="_blank" rel="noopener">LWS10-CID</a>
+        JWT to authenticate. <strong>The private key never leaves your browser.</strong></p>
+
+      <!-- Sign-in -->
+      <div class="oidc-status" id="oidc-status" role="status" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="text">Not signed in.</span>
+      </div>
+      <button type="button" id="oidc-signin">Sign in via Solid-OIDC</button>
+      <button type="button" id="oidc-signout" hidden>Sign out</button>
+
+      <!-- PATCH -->
+      <div id="patch-section" hidden>
+        <h3>1. Add an ES256K verificationMethod</h3>
+        <p class="hint">Paste your secp256k1 private key as 64 hex chars (the raw 32-byte
+          key, not a bech32 <code>nsec1…</code>). Same key used for Nostr signing — only
+          the signature scheme differs (ECDSA here vs Schnorr for Nostr events). The key
+          is held in memory for this tab only; it is never persisted.</p>
+        <label for="privkey">Private key (64 hex chars)</label>
+        <input id="privkey" name="privkey" type="password" autocomplete="off" spellcheck="false"
+               placeholder="0123…64-hex-chars…cdef">
+        <button type="button" id="patch-button">Add VM to profile</button>
+        <div class="patch-result" id="patch-result" aria-live="polite"></div>
+        <p class="hint">Implementation: authenticated GET → merge VM → PUT (with
+          <code>If-Match</code> when the server provides an ETag). True
+          <code>PATCH</code> isn't used because JSS's JSON-LD ↔ Turtle conneg
+          layer has known edge cases on patch round-trips.</p>
+      </div>
+
+      <!-- Test auth -->
+      <div id="test-section" hidden>
+        <h3>2. Sign a test JWT and authenticate</h3>
+        <p class="hint">Builds an LWS10-CID JWT signed with your privkey, hits your pod
+          with <code>Authorization: Bearer &lt;jwt&gt;</code>, and reports the verifier's
+          response.</p>
+        <button type="button" id="test-button">Test auth</button>
+        <pre class="test-result" id="test-result" aria-live="polite"></pre>
       </div>
     </section>
 
