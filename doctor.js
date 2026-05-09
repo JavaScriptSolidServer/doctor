@@ -8,7 +8,8 @@
  * no auth — just a read. The output is a green/yellow/red checklist.
  */
 
-import { runLwsCidChecks } from './lib/lws-cid.js';
+import { runLwsCidChecks, normalizeControllers } from './lib/lws-cid.js';
+import { buildNostrVerificationMethod } from './lib/multikey.js';
 
 const form     = document.getElementById('check-form');
 const input    = document.getElementById('webid');
@@ -16,6 +17,21 @@ const button   = form.querySelector('button[type="submit"]');
 const results  = document.getElementById('results');
 const checksEl = document.getElementById('checks');
 const rawEl    = document.getElementById('raw-body');
+
+const addKeySection  = document.getElementById('add-key');
+const signerStatus   = document.getElementById('signer-status');
+const connectButton  = document.getElementById('connect-signer');
+const signerOutput   = document.getElementById('signer-output');
+const pubkeyHexEl    = document.getElementById('pubkey-hex');
+const pubkeyMbEl     = document.getElementById('pubkey-multibase');
+const snippetEl      = document.getElementById('snippet');
+const snippetTarget  = document.getElementById('snippet-target');
+const copyButton     = document.getElementById('copy-snippet');
+const copyStatus     = document.getElementById('copy-status');
+
+let lastWebId = null;
+let lastDocUrl = null;
+let lastController = null;
 
 // Allow ?webid=… in the URL to pre-fill (handy for sharing / bookmarks).
 const params = new URLSearchParams(window.location.search);
@@ -37,16 +53,29 @@ form.addEventListener('submit', async (e) => {
   checksEl.innerHTML = '';
   rawEl.textContent = '';
   results.hidden = false;
+  // Hide the add-key UI immediately so a stale snippet from a previous
+  // run can't be copied or have its connect button clicked while the
+  // new diagnostics are in flight.
+  hideAddKeySection();
 
   try {
-    const checks = await runAll(url);
+    const { checks, profileFetched, webId, docUrl, controller } = await runAll(url);
     renderChecks(checks);
+    if (profileFetched && webId) {
+      lastWebId = webId;
+      lastDocUrl = docUrl;
+      lastController = controller;
+      revealAddKeySection();
+    } else {
+      hideAddKeySection();
+    }
   } catch (err) {
     renderChecks([{
       status: 'fail',
       label: 'Diagnostics crashed',
       detail: String(err?.message || err),
     }]);
+    hideAddKeySection();
   } finally {
     button.disabled = false;
     button.textContent = 'Run diagnostics';
@@ -55,6 +84,7 @@ form.addEventListener('submit', async (e) => {
 
 async function runAll(webIdUrl) {
   const checks = [];
+  const result = { checks, profileFetched: false, docUrl: null, webId: null, controller: null };
 
   // 1. Resolve the document URL — strip the fragment.
   let docUrl;
@@ -63,14 +93,14 @@ async function runAll(webIdUrl) {
     docUrl.hash = '';
   } catch (err) {
     checks.push({ status: 'fail', label: 'WebID is a valid URL', detail: err.message });
-    return checks;
+    return result;
   }
   checks.push({ status: 'pass', label: 'WebID is a valid URL', detail: docUrl.toString() });
 
   // 2. Fetch as JSON-LD. We avoid Accept: text/turtle so the conneg layer
   //    doesn't transform the document — we want to validate the JSON-LD
   //    representation directly.
-  let res, body, contentType;
+  let res, contentType;
   try {
     res = await fetch(docUrl.toString(), {
       headers: { 'Accept': 'application/ld+json' },
@@ -78,7 +108,7 @@ async function runAll(webIdUrl) {
     contentType = (res.headers.get('content-type') || '').toLowerCase();
   } catch (err) {
     checks.push({ status: 'fail', label: 'Profile is reachable', detail: err.message });
-    return checks;
+    return result;
   }
 
   if (!res.ok) {
@@ -87,7 +117,7 @@ async function runAll(webIdUrl) {
       label: 'Profile is reachable',
       detail: `HTTP ${res.status} from ${docUrl}`,
     });
-    return checks;
+    return result;
   }
   checks.push({
     status: 'pass',
@@ -121,17 +151,174 @@ async function runAll(webIdUrl) {
       label: 'Profile parses as JSON',
       detail: err.message,
     });
-    return checks;
+    return result;
+  }
+  // JSON.parse accepts null, primitives, and arrays — none of which are
+  // a usable JSON-LD profile document. Bail out before downstream code
+  // tries to read `@id`/`controller` and throws.
+  if (profile === null || typeof profile !== 'object' || Array.isArray(profile)) {
+    checks.push({
+      status: 'fail',
+      label: 'Profile parses as JSON',
+      detail: `Top-level value is ${profile === null ? 'null' : Array.isArray(profile) ? 'an array' : typeof profile}; expected a JSON object.`,
+    });
+    return result;
   }
   checks.push({ status: 'pass', label: 'Profile parses as JSON' });
 
+  // Profile was fetched and parsed — safe to root a snippet against this URL.
+  // Take the canonical WebID from the profile's own @id (absolutized
+  // against the document URL), but only when its fragmentless form
+  // matches the URL we actually fetched — otherwise the snippet's VM
+  // id would be rooted at one document while the UI tells the user to
+  // patch a different one. Untrusted input, so the URL parse is
+  // wrapped: malformed @id falls back to the user-supplied URL.
+  const profileId = profile['@id'] || profile.id;
+  let canonicalWebId = webIdUrl;
+  if (profileId) {
+    try {
+      const resolved = new URL(profileId, docUrl);
+      const resolvedNoHash = new URL(resolved);
+      resolvedNoHash.hash = '';
+      if (resolvedNoHash.toString() === docUrl.toString()) {
+        canonicalWebId = resolved.toString();
+      }
+    } catch {
+      // malformed @id; fall through to user-supplied URL
+    }
+  }
+  // Derive the controller IRI from the profile's declared `controller`
+  // (handling all four JSON-LD shapes), falling back to the canonical
+  // WebID when controller is absent. Generated VMs use this so that on
+  // delegated-control profiles the snippet matches the profile's own
+  // controller predicate (and passes the validator).
+  const declaredCtrls = normalizeControllers(profile.controller, docUrl.toString());
+  const controllerIri = declaredCtrls[0] ?? canonicalWebId;
+
+  result.profileFetched = true;
+  result.docUrl = docUrl.toString();
+  result.webId = canonicalWebId;
+  result.controller = controllerIri;
+
   // 4. Run LWS-CID structural checks.
-  for (const c of runLwsCidChecks(profile, { webIdUrl, docUrl: docUrl.toString() })) {
+  for (const c of runLwsCidChecks(profile, { webIdUrl })) {
     checks.push(c);
   }
 
-  return checks;
+  return result;
 }
+
+// --- B.2: connect Nostr signer & compute Multikey VM -----------------
+
+function revealAddKeySection() {
+  addKeySection.hidden = false;
+  // The WebID may have changed since the section was last shown; clear
+  // any prior pubkey/snippet so the user can't accidentally copy a
+  // snippet rooted at the previous WebID.
+  clearSignerOutput();
+  detectSigner();
+}
+
+function hideAddKeySection() {
+  addKeySection.hidden = true;
+  clearSignerOutput();
+  lastWebId = null;
+  lastDocUrl = null;
+  lastController = null;
+}
+
+function clearSignerOutput() {
+  signerOutput.hidden = true;
+  pubkeyHexEl.textContent = '';
+  pubkeyMbEl.textContent = '';
+  snippetEl.textContent = '';
+  snippetTarget.textContent = '';
+  connectButton.textContent = 'Connect signer';
+  copyStatus.textContent = '';
+  copyStatus.className = 'copy-status';
+}
+
+function detectSigner() {
+  if (typeof window.nostr?.getPublicKey === 'function') {
+    setSignerStatus('ready', 'NIP-07 signer detected (window.nostr).');
+    connectButton.disabled = false;
+  } else {
+    setSignerStatus('absent',
+      'No NIP-07 signer found. Install xlogin or another window.nostr provider, then reload.');
+    connectButton.disabled = true;
+  }
+}
+
+function setSignerStatus(state, text) {
+  signerStatus.className = `signer-status ${state}`;
+  signerStatus.querySelector('.text').textContent = text;
+}
+
+connectButton.addEventListener('click', async () => {
+  if (!lastWebId) return;
+  // Re-check presence: a NIP-07 provider can be uninstalled or
+  // disabled between detection and click. Throwing a raw TypeError
+  // from `window.nostr.getPublicKey()` would surface a confusing
+  // error.
+  if (typeof window.nostr?.getPublicKey !== 'function') {
+    setSignerStatus('absent',
+      'No NIP-07 signer found. Install xlogin or another window.nostr provider, then reload.');
+    connectButton.disabled = true;
+    return;
+  }
+  connectButton.disabled = true;
+  connectButton.textContent = 'Connecting…';
+  try {
+    const xOnlyHex = await window.nostr.getPublicKey();
+    if (!/^[0-9a-f]{64}$/i.test(xOnlyHex)) {
+      throw new Error(`Signer returned an unexpected pubkey: ${xOnlyHex}`);
+    }
+    renderSnippet(xOnlyHex, lastWebId, lastDocUrl, lastController);
+    signerOutput.hidden = false;
+    setSignerStatus('ready', 'Connected. The snippet below is ready to paste into your profile.');
+    connectButton.textContent = 'Reconnect signer';
+  } catch (err) {
+    clearSignerOutput();
+    setSignerStatus('error', `Could not read pubkey: ${err.message || err}`);
+  } finally {
+    connectButton.disabled = false;
+  }
+});
+
+function renderSnippet(xOnlyHex, webId, docUrl, controller) {
+  const vm = buildNostrVerificationMethod({ webId, xOnlyHex, controller });
+  pubkeyHexEl.textContent = xOnlyHex;
+  pubkeyMbEl.textContent  = vm.publicKeyMultibase;
+  // Write target is the document URL (no fragment) — you can't PUT/PATCH
+  // a fragment URI. The VM's `controller` keeps the WebID-with-fragment.
+  snippetTarget.textContent = docUrl;
+
+  // Show the three additions a CID v1 profile needs together: the
+  // verificationMethod itself, plus authentication / assertionMethod
+  // arrays referencing it. JSON-LD doesn't have "patch" syntax, so we
+  // present it as a partial document the user can merge manually.
+  const partial = {
+    verificationMethod: [vm],
+    authentication: [vm.id],
+    assertionMethod: [vm.id],
+  };
+  snippetEl.textContent = JSON.stringify(partial, null, 2);
+}
+
+copyButton.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(snippetEl.textContent);
+    copyStatus.className = 'copy-status success';
+    copyStatus.textContent = 'Copied.';
+  } catch (err) {
+    copyStatus.className = 'copy-status error';
+    copyStatus.textContent = `Couldn't copy: ${err.message || err}`;
+  }
+  setTimeout(() => {
+    copyStatus.textContent = '';
+    copyStatus.className = 'copy-status';
+  }, 2500);
+});
 
 function renderChecks(checks) {
   checksEl.innerHTML = '';

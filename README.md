@@ -6,28 +6,30 @@ A diagnostic tool for [Solid](https://solidproject.org/) pods and the surroundin
 
 **Live:** https://jss.live/doctor/
 
-## What it checks today
+## What it does today
 
-**LWS / CID v1 profile shape** — drop in a WebID URL, get a green/red checklist of what's structurally there and what's missing for [LWS 1.0](https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/) auth conformance:
+**1. LWS / CID v1 profile shape check** — drop in a WebID URL, get a pass/warn/fail/skip checklist of what's structurally there and what's missing for [LWS 1.0](https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/) auth conformance:
 
 - Profile fetches as `application/ld+json`?
 - `@context` declares the CID v1 vocabulary (controller, verificationMethod, authentication, …)?
 - `controller === @id` (CID v1 self-control contract)?
 - `verificationMethod` populated?
   - Each entry has `id`, `type`, `controller`, and either `publicKeyJwk` or `publicKeyMultibase`?
-  - `controller` of each method matches the WebID?
+  - Each method's `controller` matches the profile's declared `controller` (with fallback to `@id` when `controller` is absent), so delegated-control profiles validate correctly?
   - `id` values unique?
 - `authentication` entries point at real verificationMethods?
 - `alsoKnownAs` entries are DID URIs?
 
 Read-only — no auth, no mutations, no server roundtrip beyond the GETs.
 
+**2. Nostr verification-method generator** — reads your Nostr pubkey from a [NIP-07](https://github.com/nostr-protocol/nips/blob/master/07.md) signer (e.g. [xlogin](https://xlogin.solid.social/)), encodes it per [did:nostr](https://nostrcg.github.io/did-nostr/)'s Multikey recipe, and emits a copyable JSON snippet to add to your profile. No keys leave your browser.
+
 ## Roadmap (rough)
 
-- **B.0** — Read-only LWS-CID profile validator (this commit)
+- ~~**B.0**~~ — Read-only LWS-CID profile validator ✅
+- ~~**B.2**~~ — Read pubkey from NIP-07 signer; emit Multikey verificationMethod snippet ✅
 - **B.1** — Bidirectional `alsoKnownAs` ↔ DID-doc check (resolve `did:nostr:…` and verify the DID points back at this WebID)
-- **B.2** — xlogin / NIP-07 sign-in to act as a WebID owner
-- **B.3** — PATCH `verificationMethod` (Multikey for Nostr secp256k1) into the signed-in user's profile
+- **B.3** — In-app PATCH of the snippet via Solid-OIDC sign-in (closes the loop end-to-end)
 - **B.4** — did:key + WebAuthn passkey verification methods
 - **B.5** — More diagnostics: ACL inheritance, type-index integrity, OIDC discovery, ActivityPub actor doc, …
 
