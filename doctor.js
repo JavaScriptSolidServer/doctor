@@ -53,10 +53,10 @@ form.addEventListener('submit', async (e) => {
   results.hidden = false;
 
   try {
-    const { checks, profileFetched, docUrl } = await runAll(url);
+    const { checks, profileFetched, webId } = await runAll(url);
     renderChecks(checks);
-    if (profileFetched && docUrl) {
-      lastWebId = docUrl;
+    if (profileFetched && webId) {
+      lastWebId = webId;
       revealAddKeySection();
     } else {
       hideAddKeySection();
@@ -76,7 +76,7 @@ form.addEventListener('submit', async (e) => {
 
 async function runAll(webIdUrl) {
   const checks = [];
-  const result = { checks, profileFetched: false, docUrl: null };
+  const result = { checks, profileFetched: false, docUrl: null, webId: null };
 
   // 1. Resolve the document URL — strip the fragment.
   let docUrl;
@@ -148,11 +148,21 @@ async function runAll(webIdUrl) {
   checks.push({ status: 'pass', label: 'Profile parses as JSON' });
 
   // Profile was fetched and parsed — safe to root a snippet against this URL.
+  // Take the canonical WebID from the profile's own @id (absolutized
+  // against the document URL); fall back to the user-supplied URL if
+  // the profile didn't declare one. This preserves any fragment (e.g.
+  // "#me") so verificationMethod controllers will agree with the
+  // profile's outer controller predicate.
+  const profileId = profile['@id'] || profile.id;
+  const canonicalWebId = profileId
+    ? new URL(profileId, docUrl).toString()
+    : webIdUrl;
   result.profileFetched = true;
   result.docUrl = docUrl.toString();
+  result.webId = canonicalWebId;
 
   // 4. Run LWS-CID structural checks.
-  for (const c of runLwsCidChecks(profile, { webIdUrl, docUrl: docUrl.toString() })) {
+  for (const c of runLwsCidChecks(profile, { webIdUrl })) {
     checks.push(c);
   }
 
