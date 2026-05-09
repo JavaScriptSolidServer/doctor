@@ -9,6 +9,7 @@
  */
 
 import { runLwsCidChecks } from './lib/lws-cid.js';
+import { buildNostrVerificationMethod } from './lib/multikey.js';
 
 const form     = document.getElementById('check-form');
 const input    = document.getElementById('webid');
@@ -16,6 +17,19 @@ const button   = form.querySelector('button[type="submit"]');
 const results  = document.getElementById('results');
 const checksEl = document.getElementById('checks');
 const rawEl    = document.getElementById('raw-body');
+
+const addKeySection  = document.getElementById('add-key');
+const signerStatus   = document.getElementById('signer-status');
+const connectButton  = document.getElementById('connect-signer');
+const signerOutput   = document.getElementById('signer-output');
+const pubkeyHexEl    = document.getElementById('pubkey-hex');
+const pubkeyMbEl     = document.getElementById('pubkey-multibase');
+const snippetEl      = document.getElementById('snippet');
+const snippetTarget  = document.getElementById('snippet-target');
+const copyButton     = document.getElementById('copy-snippet');
+const copyStatus     = document.getElementById('copy-status');
+
+let lastWebId = null;
 
 // Allow ?webid=… in the URL to pre-fill (handy for sharing / bookmarks).
 const params = new URLSearchParams(window.location.search);
@@ -41,6 +55,8 @@ form.addEventListener('submit', async (e) => {
   try {
     const checks = await runAll(url);
     renderChecks(checks);
+    lastWebId = url;
+    revealAddKeySection();
   } catch (err) {
     renderChecks([{
       status: 'fail',
@@ -132,6 +148,77 @@ async function runAll(webIdUrl) {
 
   return checks;
 }
+
+// --- B.2: connect Nostr signer & compute Multikey VM -----------------
+
+function revealAddKeySection() {
+  addKeySection.hidden = false;
+  detectSigner();
+}
+
+function detectSigner() {
+  if (typeof window.nostr?.getPublicKey === 'function') {
+    setSignerStatus('ready', 'NIP-07 signer detected (window.nostr).');
+    connectButton.disabled = false;
+  } else {
+    setSignerStatus('absent',
+      'No NIP-07 signer found. Install xlogin or another window.nostr provider, then reload.');
+    connectButton.disabled = true;
+  }
+}
+
+function setSignerStatus(state, text) {
+  signerStatus.className = `signer-status ${state}`;
+  signerStatus.querySelector('.text').textContent = text;
+}
+
+connectButton.addEventListener('click', async () => {
+  if (!lastWebId) return;
+  connectButton.disabled = true;
+  connectButton.textContent = 'Connecting…';
+  try {
+    const xOnlyHex = await window.nostr.getPublicKey();
+    if (!/^[0-9a-f]{64}$/i.test(xOnlyHex)) {
+      throw new Error(`Signer returned an unexpected pubkey: ${xOnlyHex}`);
+    }
+    renderSnippet(xOnlyHex, lastWebId);
+    signerOutput.hidden = false;
+    setSignerStatus('ready', 'Connected. The snippet below is ready to paste into your profile.');
+  } catch (err) {
+    setSignerStatus('error', `Could not read pubkey: ${err.message || err}`);
+  } finally {
+    connectButton.textContent = 'Reconnect signer';
+    connectButton.disabled = false;
+  }
+});
+
+function renderSnippet(xOnlyHex, webId) {
+  const vm = buildNostrVerificationMethod({ webId, xOnlyHex });
+  pubkeyHexEl.textContent = xOnlyHex;
+  pubkeyMbEl.textContent  = vm.publicKeyMultibase;
+  snippetTarget.textContent = vm.controller;
+
+  // Show the three additions a CID v1 profile needs together: the
+  // verificationMethod itself, plus authentication / assertionMethod
+  // arrays referencing it. JSON-LD doesn't have "patch" syntax, so we
+  // present it as a partial document the user can merge manually.
+  const partial = {
+    verificationMethod: [vm],
+    authentication: [vm.id],
+    assertionMethod: [vm.id],
+  };
+  snippetEl.textContent = JSON.stringify(partial, null, 2);
+}
+
+copyButton.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(snippetEl.textContent);
+    copyStatus.textContent = 'Copied.';
+  } catch (err) {
+    copyStatus.textContent = `Couldn't copy: ${err.message || err}`;
+  }
+  setTimeout(() => { copyStatus.textContent = ''; }, 2500);
+});
 
 function renderChecks(checks) {
   checksEl.innerHTML = '';

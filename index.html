@@ -39,6 +39,41 @@
       </div>
     </section>
 
+    <section class="add-key" id="add-key" hidden>
+      <h2>Add a Nostr verification method</h2>
+      <p>Read your Nostr public key from a <a href="https://github.com/nostr-protocol/nips/blob/master/07.md" target="_blank" rel="noopener">NIP-07</a>
+        signer (e.g. <a href="https://xlogin.solid.social/" target="_blank" rel="noopener">xlogin</a>) and produce the
+        <code>verificationMethod</code> JSON to add to your profile. Encoding follows
+        <a href="https://nostrcg.github.io/did-nostr/" target="_blank" rel="noopener">did:nostr</a>'s Multikey recipe.
+        No keys are sent anywhere &mdash; this is a pure client-side computation.</p>
+
+      <div class="signer-status" id="signer-status">
+        <span class="dot"></span>
+        <span class="text">Checking for signer…</span>
+      </div>
+
+      <button type="button" id="connect-signer" disabled>Connect signer</button>
+
+      <div id="signer-output" hidden>
+        <dl class="kv">
+          <dt>Nostr pubkey (hex)</dt>
+          <dd><code id="pubkey-hex"></code></dd>
+          <dt>publicKeyMultibase</dt>
+          <dd><code id="pubkey-multibase"></code></dd>
+        </dl>
+
+        <h3>Patch to apply</h3>
+        <p class="hint">Add these triples to your <code id="snippet-target"></code>. Field
+          <code>id</code> uses the <code>#nostr-key-1</code> fragment by convention &mdash; pick another
+          if it collides.</p>
+        <pre><code id="snippet"></code></pre>
+        <button type="button" id="copy-snippet">Copy snippet</button>
+        <span class="copy-status" id="copy-status" aria-live="polite"></span>
+
+        <p class="hint future">B.3 will close the loop with an in-app PATCH so you don't need to copy/paste.</p>
+      </div>
+    </section>
+
     <footer>
       <p>
         <a href="https://github.com/JavaScriptSolidServer/doctor" target="_blank" rel="noopener">source</a>

@@ -184,3 +184,122 @@ footer a {
 }
 
 a { color: var(--accent); }
+
+/* --- B.2: add-key section ----------------------------------------- */
+
+.add-key {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+  margin-top: 20px;
+}
+.add-key h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+.add-key > p {
+  margin: 0 0 18px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.add-key code {
+  background: #eef2f7;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.add-key h3 {
+  margin: 18px 0 8px;
+  font-size: 14px;
+}
+.add-key p.hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+.add-key p.hint.future {
+  font-style: italic;
+  margin-top: 16px;
+}
+
+.signer-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.signer-status .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--skip);
+  flex-shrink: 0;
+}
+.signer-status.ready .dot { background: var(--pass); }
+.signer-status.absent .dot { background: var(--fail); }
+.signer-status.error .dot { background: var(--fail); }
+
+.add-key button {
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  padding: 9px 16px;
+  border-radius: 8px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.add-key button:hover:not(:disabled) { background: #1d4ed8; }
+.add-key button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.add-key button#copy-snippet {
+  background: #475569;
+  margin-top: 8px;
+}
+.add-key button#copy-snippet:hover:not(:disabled) { background: #334155; }
+.add-key .copy-status {
+  margin-left: 10px;
+  font-size: 12px;
+  color: var(--pass);
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 16px 0;
+  font-size: 13px;
+}
+.kv dt { font-weight: 600; }
+.kv dd {
+  margin: 0;
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 12px;
+}
+.kv dd code {
+  display: inline;
+  background: transparent;
+  padding: 0;
+}
+
+#snippet {
+  display: block;
+  background: #0f172a;
+  color: #cbd5e1;
+  padding: 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+}
+#snippet pre, .add-key pre {
+  margin: 0;
+}
