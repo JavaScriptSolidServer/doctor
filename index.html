@@ -76,8 +76,9 @@
 
     <section class="lws-auth" id="lws-auth" hidden>
       <h2>Strict LWS10-CID auth setup</h2>
-      <p>Sign in to your pod, paste a secp256k1 private key (your Nostr nsec hex works
-        &mdash; same key, different signature scheme), and the doctor adds a
+      <p>Sign in to your pod, paste a secp256k1 private key as 64 hex chars (the raw
+        32-byte key behind your Nostr <code>nsec1…</code> bech32 &mdash; same key,
+        different signature scheme), and the doctor adds a
         <code>JsonWebKey</code> verificationMethod to your profile (read-modify-write over
         authenticated GET + PUT) and signs a real
         <a href="https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/" target="_blank" rel="noopener">LWS10-CID</a>
@@ -94,10 +95,11 @@
       <!-- PATCH -->
       <div id="patch-section" hidden>
         <h3>1. Add an ES256K verificationMethod</h3>
-        <p class="hint">Paste your secp256k1 private key as 64 hex chars. Same key used for
-          Nostr signing (only the signature scheme differs &mdash; ECDSA vs Schnorr). The key
+        <p class="hint">Paste your secp256k1 private key as 64 hex chars (the raw 32-byte
+          key, not a bech32 <code>nsec1…</code>). Same key used for Nostr signing — only
+          the signature scheme differs (ECDSA here vs Schnorr for Nostr events). The key
           is held in memory for this tab only; it is never persisted.</p>
-        <label for="privkey">Private key (hex)</label>
+        <label for="privkey">Private key (64 hex chars)</label>
         <input id="privkey" name="privkey" type="password" autocomplete="off" spellcheck="false"
                placeholder="0123…64-hex-chars…cdef">
         <button type="button" id="patch-button">Add VM to profile</button>

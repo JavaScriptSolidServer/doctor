@@ -436,16 +436,6 @@ patchButton.addEventListener('click', async () => {
     const priv = validatePrivKey(privkeyInput.value);
     memPrivKey = priv;
 
-    const { vm, kid } = buildEs256kVerificationMethod({
-      privKey: priv,
-      webId: lastWebId,
-      // For delegated-control profiles use the diagnosed controller,
-      // not the WebID — otherwise the VM's controller will mismatch
-      // the profile's outer controller predicate and verifiers reject.
-      controller: lastController ?? lastWebId,
-    });
-    lastVmKid = kid;
-
     // Read-modify-write: GET via authFetch (so we see the
     // authoritative current state, including any private triples),
     // merge our VM into verificationMethod / authentication, PUT back.
@@ -455,6 +445,18 @@ patchButton.addEventListener('click', async () => {
     if (!getRes.ok) throw new Error(`GET profile: HTTP ${getRes.status}`);
     const etag = getRes.headers.get('etag');
     const current = await getRes.json();
+
+    // Pick a fragment that's either unused or already holds the same
+    // key (idempotent re-run). Re-running with a different key won't
+    // silently clobber an existing one — we walk lws-key-N until we
+    // find a free or matching slot.
+    const { fragment, vm, kid } = chooseFragmentAndBuildVm({
+      privKey: priv,
+      profile: current,
+      webId: lastWebId,
+      controller: lastController ?? lastWebId,
+    });
+    lastVmKid = kid;
 
     const merged = mergeVerificationMethod(current, vm);
 
@@ -478,7 +480,8 @@ patchButton.addEventListener('click', async () => {
 
     patchResult.className = 'patch-result ok';
     patchResult.textContent =
-      `Added ${kid} to verificationMethod and authentication.\n` +
+      `Added ${kid} to verificationMethod and authentication ` +
+      `(fragment chosen: #${fragment}).\n` +
       `Profile updated. You can now test LWS-CID auth below.`;
     testSection.hidden = false;
     privkeyInput.value = '';
@@ -539,17 +542,61 @@ testButton.addEventListener('click', async () => {
 });
 
 /**
+ * Choose a non-colliding fragment for the new VM, then build it.
+ *
+ * - If `lws-key-1` is unused, take it.
+ * - If `lws-key-1` already holds *the same* public key (re-run), take
+ *   it — the merge will be a no-op replace.
+ * - Otherwise walk lws-key-2, lws-key-3, … until we find an unused
+ *   slot or one that already matches. Cap at 99 to bound work; if a
+ *   user has somehow accumulated 99 distinct VMs they should clean
+ *   up first.
+ */
+function chooseFragmentAndBuildVm({ privKey, profile, webId, controller }) {
+  const docUrl = stripHashLocal(webId);
+  const vms = Array.isArray(profile.verificationMethod) ? profile.verificationMethod
+            : profile.verificationMethod ? [profile.verificationMethod]
+            : [];
+
+  // Pre-build the VM once so we can compare its JWK against existing
+  // entries. The fragment will be re-stamped on the chosen one below.
+  const probe = buildEs256kVerificationMethod({ privKey, webId, controller, fragment: 'probe' });
+
+  for (let n = 1; n <= 99; n++) {
+    const candidateId = `${docUrl}#lws-key-${n}`;
+    const existing = vms.find((v) => entryMatchesId(v, candidateId));
+    if (!existing) {
+      const result = buildEs256kVerificationMethod({
+        privKey, webId, controller, fragment: `lws-key-${n}`,
+      });
+      return { fragment: `lws-key-${n}`, vm: result.vm, kid: result.kid };
+    }
+    // Slot taken — only re-use if the existing entry has the SAME
+    // public-key material (idempotent re-run).
+    if (typeof existing === 'object' && existing !== null) {
+      const existingJwk = existing.publicKeyJwk;
+      if (existingJwk && sameJwk(existingJwk, probe.publicKeyJwk)) {
+        const result = buildEs256kVerificationMethod({
+          privKey, webId, controller, fragment: `lws-key-${n}`,
+        });
+        return { fragment: `lws-key-${n}`, vm: result.vm, kid: result.kid };
+      }
+      // Different key here — try the next slot.
+    } else {
+      // String-IRI entry takes the slot but carries no key material.
+      // We can't tell whether it's "ours" or someone else's. Skip to
+      // the next slot to be safe.
+    }
+  }
+  throw new Error('all lws-key-1..99 fragments are taken — clean up your profile first');
+}
+
+/**
  * Merge a verificationMethod entry into a profile.
  *
- * Idempotent on re-runs of the SAME key: replaces the existing entry
- * (same id, same publicKeyJwk) so we don't grow duplicates.
- *
- * Refuses to clobber a different key sitting at the same fragment —
- * an existing VM with the same id but DIFFERENT publicKeyJwk throws.
- * The user can pick another fragment if they want to keep both keys
- * (key rotation should happen at a fresh fragment, e.g. `lws-key-2`,
- * with the old one removed from `authentication` once rotation is
- * complete).
+ * Idempotent on re-runs: when the entry's id matches an existing VM,
+ * replaces it. (chooseFragmentAndBuildVm guarantees same-id ⇒ same-key
+ * before we get here, so this can't silently clobber.)
  *
  * Handles string-IRI verificationMethod entries (which JSON-LD
  * permits) — finds them by IRI equality so the entry isn't duplicated.
@@ -560,24 +607,8 @@ function mergeVerificationMethod(profile, vm) {
             : out.verificationMethod ? [out.verificationMethod]
             : [];
   const idx = vms.findIndex((v) => entryMatchesId(v, vm.id));
-  if (idx >= 0) {
-    const existing = vms[idx];
-    // String-IRI entries don't carry inline material — replacing
-    // them with our embedded VM is fine. For embedded entries with a
-    // different publicKeyJwk, refuse to overwrite.
-    if (typeof existing === 'object' && existing !== null) {
-      const existingJwk = existing.publicKeyJwk;
-      if (existingJwk && !sameJwk(existingJwk, vm.publicKeyJwk)) {
-        throw new Error(
-          `verificationMethod ${vm.id} already exists with a different public key — ` +
-          `pick a new fragment (e.g. lws-key-2) or remove the existing entry first`,
-        );
-      }
-    }
-    vms[idx] = vm;
-  } else {
-    vms.push(vm);
-  }
+  if (idx >= 0) vms[idx] = vm;
+  else vms.push(vm);
   out.verificationMethod = vms;
 
   const auth = Array.isArray(out.authentication) ? [...out.authentication]
@@ -606,15 +637,33 @@ function sameJwk(a, b) {
     && a.y === b.y;
 }
 
+function stripHashLocal(u) {
+  try {
+    const url = new URL(u);
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return String(u).split('#')[0];
+  }
+}
+
 function extractIssuer(profile) {
   // JSS emits oidcIssuer in compact form via the profile @context. Some
-  // clients use the full predicate URI or the prefixed form; support all.
+  // clients use the full predicate URI or the prefixed form; support
+  // all. The value can also be an array (JSON-LD permits it for any
+  // predicate) — take the first usable entry.
   const raw = profile?.oidcIssuer
            ?? profile?.['solid:oidcIssuer']
            ?? profile?.['http://www.w3.org/ns/solid/terms#oidcIssuer'];
-  if (!raw) return null;
-  if (typeof raw === 'string') return raw;
-  if (typeof raw === 'object') return raw['@id'] || raw.id || null;
+  if (raw === null || raw === undefined) return null;
+  const list = Array.isArray(raw) ? raw : [raw];
+  for (const v of list) {
+    if (typeof v === 'string') return v;
+    if (v && typeof v === 'object') {
+      const id = v['@id'] || v.id;
+      if (typeof id === 'string') return id;
+    }
+  }
   return null;
 }
 
