@@ -35,7 +35,6 @@ let lastWebId = null;
 let lastDocUrl = null;
 let lastController = null;
 let lastIssuer = null;
-let lastProfile = null;
 let lastVmKid = null;
 let memPrivKey = null; // 32-byte secp256k1 privkey, in-memory only
 
@@ -66,13 +65,12 @@ form.addEventListener('submit', async (e) => {
   hideLwsAuthSection();
 
   try {
-    const { checks, profileFetched, webId, docUrl, controller, profile, issuer } = await runAll(url);
+    const { checks, profileFetched, webId, docUrl, controller, issuer } = await runAll(url);
     renderChecks(checks);
     if (profileFetched && webId) {
       lastWebId = webId;
       lastDocUrl = docUrl;
       lastController = controller;
-      lastProfile = profile;
       lastIssuer = issuer;
       revealAddKeySection();
       revealLwsAuthSection();
@@ -210,7 +208,6 @@ async function runAll(webIdUrl) {
   result.docUrl = docUrl.toString();
   result.webId = canonicalWebId;
   result.controller = controllerIri;
-  result.profile = profile;
   result.issuer = extractIssuer(profile);
 
   // 4. Run LWS-CID structural checks.
@@ -357,6 +354,13 @@ const session = new Session({
     oidcSignOutBtn.hidden = !isActive;
     patchSection.hidden = !isActive;
     if (!isActive) {
+      // Drop any pasted privkey + cached VM kid the moment the session
+      // ends. The UI promises sign-out clears state, and a privkey
+      // sitting in a tab that's no longer authenticated is just
+      // exposure with no purpose.
+      memPrivKey = null;
+      lastVmKid = null;
+      privkeyInput.value = '';
       testSection.hidden = true;
       patchResult.textContent = '';
       patchResult.className = 'patch-result';
@@ -435,6 +439,10 @@ patchButton.addEventListener('click', async () => {
     const { vm, kid } = buildEs256kVerificationMethod({
       privKey: priv,
       webId: lastWebId,
+      // For delegated-control profiles use the diagnosed controller,
+      // not the WebID — otherwise the VM's controller will mismatch
+      // the profile's outer controller predicate and verifiers reject.
+      controller: lastController ?? lastWebId,
     });
     lastVmKid = kid;
 
@@ -445,14 +453,27 @@ patchButton.addEventListener('click', async () => {
       headers: { Accept: 'application/ld+json' },
     });
     if (!getRes.ok) throw new Error(`GET profile: HTTP ${getRes.status}`);
+    const etag = getRes.headers.get('etag');
     const current = await getRes.json();
 
     const merged = mergeVerificationMethod(current, vm);
+
+    const putHeaders = { 'Content-Type': 'application/ld+json' };
+    // Use If-Match to defeat lost-update on concurrent edits. JSS
+    // returns ETags on profile resources; servers without ETag support
+    // fall through with no header.
+    if (etag) putHeaders['If-Match'] = etag;
+
     const putRes = await session.authFetch(lastDocUrl, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/ld+json' },
+      headers: putHeaders,
       body: JSON.stringify(merged, null, 2),
     });
+    if (putRes.status === 412 || putRes.status === 409) {
+      throw new Error(
+        `profile changed since GET (HTTP ${putRes.status}). Re-run diagnostics and try again.`,
+      );
+    }
     if (!putRes.ok) throw new Error(`PUT profile: HTTP ${putRes.status}`);
 
     patchResult.className = 'patch-result ok';
@@ -518,18 +539,45 @@ testButton.addEventListener('click', async () => {
 });
 
 /**
- * Merge a verificationMethod entry into a profile, idempotently.
- * Replaces an existing entry with the same `id`, otherwise appends.
- * Also adds the entry's id to `authentication` if not already there.
+ * Merge a verificationMethod entry into a profile.
+ *
+ * Idempotent on re-runs of the SAME key: replaces the existing entry
+ * (same id, same publicKeyJwk) so we don't grow duplicates.
+ *
+ * Refuses to clobber a different key sitting at the same fragment —
+ * an existing VM with the same id but DIFFERENT publicKeyJwk throws.
+ * The user can pick another fragment if they want to keep both keys
+ * (key rotation should happen at a fresh fragment, e.g. `lws-key-2`,
+ * with the old one removed from `authentication` once rotation is
+ * complete).
+ *
+ * Handles string-IRI verificationMethod entries (which JSON-LD
+ * permits) — finds them by IRI equality so the entry isn't duplicated.
  */
 function mergeVerificationMethod(profile, vm) {
   const out = { ...profile };
   const vms = Array.isArray(out.verificationMethod) ? [...out.verificationMethod]
             : out.verificationMethod ? [out.verificationMethod]
             : [];
-  const idx = vms.findIndex((v) => (v?.id || v?.['@id']) === vm.id);
-  if (idx >= 0) vms[idx] = vm;
-  else vms.push(vm);
+  const idx = vms.findIndex((v) => entryMatchesId(v, vm.id));
+  if (idx >= 0) {
+    const existing = vms[idx];
+    // String-IRI entries don't carry inline material — replacing
+    // them with our embedded VM is fine. For embedded entries with a
+    // different publicKeyJwk, refuse to overwrite.
+    if (typeof existing === 'object' && existing !== null) {
+      const existingJwk = existing.publicKeyJwk;
+      if (existingJwk && !sameJwk(existingJwk, vm.publicKeyJwk)) {
+        throw new Error(
+          `verificationMethod ${vm.id} already exists with a different public key — ` +
+          `pick a new fragment (e.g. lws-key-2) or remove the existing entry first`,
+        );
+      }
+    }
+    vms[idx] = vm;
+  } else {
+    vms.push(vm);
+  }
   out.verificationMethod = vms;
 
   const auth = Array.isArray(out.authentication) ? [...out.authentication]
@@ -540,6 +588,22 @@ function mergeVerificationMethod(profile, vm) {
   }
   out.authentication = auth;
   return out;
+}
+
+function entryMatchesId(entry, id) {
+  if (typeof entry === 'string') return entry === id;
+  if (entry && typeof entry === 'object') return (entry.id || entry['@id']) === id;
+  return false;
+}
+
+function sameJwk(a, b) {
+  // Compare the public-key material, not auxiliary fields like `kid`,
+  // `alg`, or `use`. Two VMs are "the same key" iff x and y match.
+  return a && b
+    && a.kty === b.kty
+    && a.crv === b.crv
+    && a.x === b.x
+    && a.y === b.y;
 }
 
 function extractIssuer(profile) {
