@@ -4,7 +4,7 @@ A diagnostic tool for [Solid](https://solidproject.org/) pods and the surroundin
 
 > **Status:** alpha. First diagnostic ships as the LWS / W3C Controlled Identifiers v1.0 profile-shape check. More will accrete; well-defined ones may extract into focused tools.
 
-**Live:** https://javascriptsolidserver.github.io/doctor/
+**Live:** https://jss.live/doctor/
 
 ## What it checks today
 
