@@ -10,6 +10,8 @@
 
 import { runLwsCidChecks, normalizeControllers } from './lib/lws-cid.js';
 import { buildNostrVerificationMethod } from './lib/multikey.js';
+import { buildEs256kVerificationMethod, signLwsCidJwt, validatePrivKey } from './lib/lws-cid-client.js';
+import { Session } from 'https://esm.sh/solid-oidc@0.0.8';
 
 const form     = document.getElementById('check-form');
 const input    = document.getElementById('webid');
@@ -32,6 +34,10 @@ const copyStatus     = document.getElementById('copy-status');
 let lastWebId = null;
 let lastDocUrl = null;
 let lastController = null;
+let lastIssuer = null;
+let lastProfile = null;
+let lastVmKid = null;
+let memPrivKey = null; // 32-byte secp256k1 privkey, in-memory only
 
 // Allow ?webid=… in the URL to pre-fill (handy for sharing / bookmarks).
 const params = new URLSearchParams(window.location.search);
@@ -57,17 +63,22 @@ form.addEventListener('submit', async (e) => {
   // run can't be copied or have its connect button clicked while the
   // new diagnostics are in flight.
   hideAddKeySection();
+  hideLwsAuthSection();
 
   try {
-    const { checks, profileFetched, webId, docUrl, controller } = await runAll(url);
+    const { checks, profileFetched, webId, docUrl, controller, profile, issuer } = await runAll(url);
     renderChecks(checks);
     if (profileFetched && webId) {
       lastWebId = webId;
       lastDocUrl = docUrl;
       lastController = controller;
+      lastProfile = profile;
+      lastIssuer = issuer;
       revealAddKeySection();
+      revealLwsAuthSection();
     } else {
       hideAddKeySection();
+      hideLwsAuthSection();
     }
   } catch (err) {
     renderChecks([{
@@ -199,6 +210,8 @@ async function runAll(webIdUrl) {
   result.docUrl = docUrl.toString();
   result.webId = canonicalWebId;
   result.controller = controllerIri;
+  result.profile = profile;
+  result.issuer = extractIssuer(profile);
 
   // 4. Run LWS-CID structural checks.
   for (const c of runLwsCidChecks(profile, { webIdUrl })) {
@@ -319,6 +332,227 @@ copyButton.addEventListener('click', async () => {
     copyStatus.className = 'copy-status';
   }, 2500);
 });
+
+// --- B.3: strict LWS-CID auth (Solid-OIDC sign-in + ES256K JWT) ----
+
+const lwsAuthSection  = document.getElementById('lws-auth');
+const oidcStatusEl    = document.getElementById('oidc-status');
+const oidcSignInBtn   = document.getElementById('oidc-signin');
+const oidcSignOutBtn  = document.getElementById('oidc-signout');
+const patchSection    = document.getElementById('patch-section');
+const privkeyInput    = document.getElementById('privkey');
+const patchButton     = document.getElementById('patch-button');
+const patchResult     = document.getElementById('patch-result');
+const testSection     = document.getElementById('test-section');
+const testButton      = document.getElementById('test-button');
+const testResult      = document.getElementById('test-result');
+
+const session = new Session({
+  onStateChange: (e) => {
+    const isActive = e?.detail?.isActive;
+    const webId = e?.detail?.webId;
+    setOidcStatus(isActive ? 'signed-in' : null,
+      isActive ? `Signed in as ${webId}` : 'Not signed in.');
+    oidcSignInBtn.hidden = !!isActive;
+    oidcSignOutBtn.hidden = !isActive;
+    patchSection.hidden = !isActive;
+    if (!isActive) {
+      testSection.hidden = true;
+      patchResult.textContent = '';
+      patchResult.className = 'patch-result';
+      testResult.textContent = '';
+      testResult.className = 'test-result';
+    }
+  },
+});
+
+// Restore any prior session (saved in IndexedDB by solid-oidc) and
+// handle the redirect-back from the IdP if we just landed on one.
+session.restore().catch(() => { /* no prior session — fine */ });
+session.handleRedirectFromLogin().catch((err) => {
+  setOidcStatus('error', `Sign-in callback failed: ${err.message || err}`);
+});
+
+function setOidcStatus(state, text) {
+  oidcStatusEl.className = `oidc-status${state ? ' ' + state : ''}`;
+  oidcStatusEl.querySelector('.text').textContent = text;
+}
+
+function revealLwsAuthSection() {
+  lwsAuthSection.hidden = false;
+  // Only enable sign-in if we have an issuer to point at.
+  oidcSignInBtn.disabled = !lastIssuer;
+  if (!lastIssuer) {
+    setOidcStatus('error',
+      'Profile declares no oidcIssuer — cannot start a Solid-OIDC sign-in.');
+  }
+}
+
+function hideLwsAuthSection() {
+  lwsAuthSection.hidden = true;
+  patchResult.textContent = '';
+  patchResult.className = 'patch-result';
+  testResult.textContent = '';
+  testResult.className = 'test-result';
+  testSection.hidden = true;
+  memPrivKey = null;
+  lastVmKid = null;
+}
+
+oidcSignInBtn.addEventListener('click', async () => {
+  if (!lastIssuer) return;
+  try {
+    // Persist current target across the redirect — strip any login
+    // params on the way back.
+    const returnUrl = `${window.location.pathname}?webid=${encodeURIComponent(lastWebId)}`;
+    await session.login(lastIssuer, new URL(returnUrl, window.location.origin).toString());
+  } catch (err) {
+    setOidcStatus('error', `Could not start sign-in: ${err.message || err}`);
+  }
+});
+
+oidcSignOutBtn.addEventListener('click', async () => {
+  try {
+    await session.logout();
+  } catch (err) {
+    setOidcStatus('error', `Sign-out failed: ${err.message || err}`);
+  }
+});
+
+patchButton.addEventListener('click', async () => {
+  patchResult.className = 'patch-result info';
+  patchResult.textContent = 'Working…';
+  try {
+    if (!session.isActive) throw new Error('not signed in');
+    if (!session.webId) throw new Error('signed-in session has no webId');
+    if (session.webId !== lastWebId) {
+      throw new Error(
+        `signed-in WebID (${session.webId}) doesn't match the diagnosed one (${lastWebId})`);
+    }
+    const priv = validatePrivKey(privkeyInput.value);
+    memPrivKey = priv;
+
+    const { vm, kid } = buildEs256kVerificationMethod({
+      privKey: priv,
+      webId: lastWebId,
+    });
+    lastVmKid = kid;
+
+    // Read-modify-write: GET via authFetch (so we see the
+    // authoritative current state, including any private triples),
+    // merge our VM into verificationMethod / authentication, PUT back.
+    const getRes = await session.authFetch(lastDocUrl, {
+      headers: { Accept: 'application/ld+json' },
+    });
+    if (!getRes.ok) throw new Error(`GET profile: HTTP ${getRes.status}`);
+    const current = await getRes.json();
+
+    const merged = mergeVerificationMethod(current, vm);
+    const putRes = await session.authFetch(lastDocUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/ld+json' },
+      body: JSON.stringify(merged, null, 2),
+    });
+    if (!putRes.ok) throw new Error(`PUT profile: HTTP ${putRes.status}`);
+
+    patchResult.className = 'patch-result ok';
+    patchResult.textContent =
+      `Added ${kid} to verificationMethod and authentication.\n` +
+      `Profile updated. You can now test LWS-CID auth below.`;
+    testSection.hidden = false;
+    privkeyInput.value = '';
+  } catch (err) {
+    patchResult.className = 'patch-result error';
+    patchResult.textContent = `Failed: ${err.message || err}`;
+    memPrivKey = null;
+  }
+});
+
+testButton.addEventListener('click', async () => {
+  testResult.className = 'test-result info';
+  testResult.textContent = 'Signing JWT and calling pod…';
+  try {
+    if (!memPrivKey) throw new Error('no privkey in memory — re-run the PATCH step');
+    if (!lastVmKid)  throw new Error('no VM id captured — re-run the PATCH step');
+
+    const audience = new URL(lastDocUrl).origin;
+    const jwt = await signLwsCidJwt({
+      privKey: memPrivKey,
+      kid: lastVmKid,
+      webId: lastWebId,
+      audience,
+    });
+
+    // Hit the WebID's own resource. The doctor's plain `fetch` (NOT
+    // session.authFetch) so the only auth on the wire is the JWT we
+    // just minted — that's what we want to test.
+    const res = await fetch(lastDocUrl, {
+      headers: {
+        Accept: 'application/ld+json',
+        Authorization: `Bearer ${jwt}`,
+      },
+    });
+
+    const wacAllow = res.headers.get('wac-allow') || '(none)';
+    const summary = [
+      `Status: ${res.status} ${res.statusText}`,
+      `WAC-Allow: ${wacAllow}`,
+      '',
+      `JWT (truncated): ${jwt.slice(0, 80)}…`,
+    ].join('\n');
+
+    if (res.ok) {
+      testResult.className = 'test-result ok';
+      testResult.textContent = `LWS10-CID auth round-trip OK!\n\n${summary}`;
+    } else {
+      // Even on 4xx the response can carry useful diagnostics in the body.
+      const body = await res.text().catch(() => '');
+      testResult.className = 'test-result error';
+      testResult.textContent =
+        `Pod rejected the JWT.\n\n${summary}\n\nResponse body:\n${body.slice(0, 500)}`;
+    }
+  } catch (err) {
+    testResult.className = 'test-result error';
+    testResult.textContent = `Failed: ${err.message || err}`;
+  }
+});
+
+/**
+ * Merge a verificationMethod entry into a profile, idempotently.
+ * Replaces an existing entry with the same `id`, otherwise appends.
+ * Also adds the entry's id to `authentication` if not already there.
+ */
+function mergeVerificationMethod(profile, vm) {
+  const out = { ...profile };
+  const vms = Array.isArray(out.verificationMethod) ? [...out.verificationMethod]
+            : out.verificationMethod ? [out.verificationMethod]
+            : [];
+  const idx = vms.findIndex((v) => (v?.id || v?.['@id']) === vm.id);
+  if (idx >= 0) vms[idx] = vm;
+  else vms.push(vm);
+  out.verificationMethod = vms;
+
+  const auth = Array.isArray(out.authentication) ? [...out.authentication]
+             : out.authentication ? [out.authentication]
+             : [];
+  if (!auth.some((a) => (typeof a === 'string' ? a : a?.['@id'] || a?.id) === vm.id)) {
+    auth.push(vm.id);
+  }
+  out.authentication = auth;
+  return out;
+}
+
+function extractIssuer(profile) {
+  // JSS emits oidcIssuer in compact form via the profile @context. Some
+  // clients use the full predicate URI or the prefixed form; support all.
+  const raw = profile?.oidcIssuer
+           ?? profile?.['solid:oidcIssuer']
+           ?? profile?.['http://www.w3.org/ns/solid/terms#oidcIssuer'];
+  if (!raw) return null;
+  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'object') return raw['@id'] || raw.id || null;
+  return null;
+}
 
 function renderChecks(checks) {
   checksEl.innerHTML = '';
