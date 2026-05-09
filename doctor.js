@@ -30,6 +30,7 @@ const copyButton     = document.getElementById('copy-snippet');
 const copyStatus     = document.getElementById('copy-status');
 
 let lastWebId = null;
+let lastDocUrl = null;
 
 // Allow ?webid=… in the URL to pre-fill (handy for sharing / bookmarks).
 const params = new URLSearchParams(window.location.search);
@@ -53,10 +54,11 @@ form.addEventListener('submit', async (e) => {
   results.hidden = false;
 
   try {
-    const { checks, profileFetched, webId } = await runAll(url);
+    const { checks, profileFetched, webId, docUrl } = await runAll(url);
     renderChecks(checks);
     if (profileFetched && webId) {
       lastWebId = webId;
+      lastDocUrl = docUrl;
       revealAddKeySection();
     } else {
       hideAddKeySection();
@@ -178,12 +180,9 @@ function revealAddKeySection() {
 
 function hideAddKeySection() {
   addKeySection.hidden = true;
-  signerOutput.hidden = true;
-  pubkeyHexEl.textContent = '';
-  pubkeyMbEl.textContent = '';
-  snippetEl.textContent = '';
-  snippetTarget.textContent = '';
+  clearSignerOutput();
   lastWebId = null;
+  lastDocUrl = null;
 }
 
 function clearSignerOutput() {
@@ -192,6 +191,8 @@ function clearSignerOutput() {
   pubkeyMbEl.textContent = '';
   snippetEl.textContent = '';
   snippetTarget.textContent = '';
+  connectButton.textContent = 'Connect signer';
+  copyStatus.textContent = '';
 }
 
 function detectSigner() {
@@ -219,23 +220,25 @@ connectButton.addEventListener('click', async () => {
     if (!/^[0-9a-f]{64}$/i.test(xOnlyHex)) {
       throw new Error(`Signer returned an unexpected pubkey: ${xOnlyHex}`);
     }
-    renderSnippet(xOnlyHex, lastWebId);
+    renderSnippet(xOnlyHex, lastWebId, lastDocUrl);
     signerOutput.hidden = false;
     setSignerStatus('ready', 'Connected. The snippet below is ready to paste into your profile.');
+    connectButton.textContent = 'Reconnect signer';
   } catch (err) {
     clearSignerOutput();
     setSignerStatus('error', `Could not read pubkey: ${err.message || err}`);
   } finally {
-    connectButton.textContent = 'Reconnect signer';
     connectButton.disabled = false;
   }
 });
 
-function renderSnippet(xOnlyHex, webId) {
+function renderSnippet(xOnlyHex, webId, docUrl) {
   const vm = buildNostrVerificationMethod({ webId, xOnlyHex });
   pubkeyHexEl.textContent = xOnlyHex;
   pubkeyMbEl.textContent  = vm.publicKeyMultibase;
-  snippetTarget.textContent = vm.controller;
+  // Write target is the document URL (no fragment) — you can't PUT/PATCH
+  // a fragment URI. The VM's `controller` keeps the WebID-with-fragment.
+  snippetTarget.textContent = docUrl;
 
   // Show the three additions a CID v1 profile needs together: the
   // verificationMethod itself, plus authentication / assertionMethod

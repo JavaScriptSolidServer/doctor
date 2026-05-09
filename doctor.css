@@ -300,6 +300,6 @@ a { color: var(--accent); }
   white-space: pre;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
 }
-#snippet pre, .add-key pre {
+.add-key pre {
   margin: 0;
 }
