@@ -52,6 +52,10 @@ form.addEventListener('submit', async (e) => {
   checksEl.innerHTML = '';
   rawEl.textContent = '';
   results.hidden = false;
+  // Hide the add-key UI immediately so a stale snippet from a previous
+  // run can't be copied or have its connect button clicked while the
+  // new diagnostics are in flight.
+  hideAddKeySection();
 
   try {
     const { checks, profileFetched, webId, docUrl } = await runAll(url);
@@ -186,6 +190,10 @@ async function runAll(webIdUrl) {
 
 function revealAddKeySection() {
   addKeySection.hidden = false;
+  // The WebID may have changed since the section was last shown; clear
+  // any prior pubkey/snippet so the user can't accidentally copy a
+  // snippet rooted at the previous WebID.
+  clearSignerOutput();
   detectSigner();
 }
 
