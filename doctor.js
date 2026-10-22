@@ -1,758 +1,361 @@
 /**
- * doctor — Solid pod diagnostics
+ * doctor — connect a Nostr key to a Solid pod.
  *
- * B.0: Read-only LWS / W3C Controlled Identifiers v1.0 profile-shape check.
+ * The one task on the page: sign in to the pod with Solid-OIDC, take the public key
+ * from the NIP-07 signer, write it into the WebID profile as a Multikey
+ * verificationMethod referenced from `authentication`, then prove it with a NIP-98
+ * request. JSS then treats that key as the pod owner (src/auth/nostr.js), so apps
+ * signing with it need no further sign-in.
  *
- * Fetches a WebID URL with Accept: application/ld+json and runs a series
- * of structural checks against the parsed JSON-LD profile. No mutations,
- * no auth — just a read. The output is a green/yellow/red checklist.
+ * Under "Advanced": the LWS / CID v1 profile checks and the ES256K JWT test client,
+ * unchanged from before, loaded only when used.
  */
-
+import { Session } from './vendor/solid-oidc.js';
+import { buildNostrVerificationMethod, multikeyToNostrPubkey } from './lib/multikey.js';
 import { runLwsCidChecks, normalizeControllers } from './lib/lws-cid.js';
-import { buildNostrVerificationMethod } from './lib/multikey.js';
-import { buildEs256kVerificationMethod, signLwsCidJwt, validatePrivKey } from './lib/lws-cid-client.js';
-import { Session } from 'https://esm.sh/solid-oidc@0.0.8';
 
-const form     = document.getElementById('check-form');
-const input    = document.getElementById('webid');
-const button   = form.querySelector('button[type="submit"]');
-const results  = document.getElementById('results');
-const checksEl = document.getElementById('checks');
-const rawEl    = document.getElementById('raw-body');
+const $ = (id) => document.getElementById(id);
+const el = {
+  form: $('link-form'), pod: $('pod'), go: $('go'), signer: $('signer'), steps: $('steps'),
+  done: $('done'), doneDid: $('done-did'), doneWebId: $('done-webid'), again: $('again'),
+  check: $('check'), checks: $('checks'), raw: $('raw'), rawBody: $('raw-body'),
+  privkey: $('privkey'), jwtAdd: $('jwt-add'), jwtTest: $('jwt-test'), jwtOut: $('jwt-out'),
+  sessionWebId: $('session-webid'), signout: $('signout'),
+};
 
-const addKeySection  = document.getElementById('add-key');
-const signerStatus   = document.getElementById('signer-status');
-const connectButton  = document.getElementById('connect-signer');
-const signerOutput   = document.getElementById('signer-output');
-const pubkeyHexEl    = document.getElementById('pubkey-hex');
-const pubkeyMbEl     = document.getElementById('pubkey-multibase');
-const snippetEl      = document.getElementById('snippet');
-const snippetTarget  = document.getElementById('snippet-target');
-const copyButton     = document.getElementById('copy-snippet');
-const copyStatus     = document.getElementById('copy-status');
+const ICONS = { pass: '✓', warn: '!', fail: '✗', busy: '…', skip: '·' };
 
-let lastWebId = null;
-let lastDocUrl = null;
-let lastController = null;
-let lastIssuer = null;
-let lastVmKid = null;
-let memPrivKey = null; // 32-byte secp256k1 privkey, in-memory only
-
-/**
- * Zero out + drop the in-memory privkey. JS gives us no real memory
- * clearing — once we release a Uint8Array reference, the previous
- * bytes hang around in the heap until GC. But we own this buffer, so
- * overwriting in place at least removes the secret from anything we
- * still hold, which is meaningful for a multi-step UI flow where the
- * key sits around between PATCH and Test.
- */
-function clearMemPrivKey() {
-  if (memPrivKey) {
-    try { memPrivKey.fill(0); } catch { /* not a Uint8Array — fine */ }
-  }
-  memPrivKey = null;
-}
-
-// Allow ?webid=… in the URL to pre-fill (handy for sharing / bookmarks).
-const params = new URLSearchParams(window.location.search);
-if (params.has('webid')) {
-  input.value = params.get('webid');
-}
-
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const url = input.value.trim();
-  if (!url) return;
-
-  // Reflect the current target in the URL so refreshes / bookmarks survive.
-  const newParams = new URLSearchParams({ webid: url });
-  history.replaceState(null, '', `${window.location.pathname}?${newParams.toString()}`);
-
-  button.disabled = true;
-  button.textContent = 'Running…';
-  checksEl.innerHTML = '';
-  rawEl.textContent = '';
-  results.hidden = false;
-  // Hide the add-key UI immediately so a stale snippet from a previous
-  // run can't be copied or have its connect button clicked while the
-  // new diagnostics are in flight.
-  hideAddKeySection();
-  hideLwsAuthSection();
-
-  try {
-    const { checks, profileFetched, webId, docUrl, controller, issuer } = await runAll(url);
-    renderChecks(checks);
-    if (profileFetched && webId) {
-      lastWebId = webId;
-      lastDocUrl = docUrl;
-      lastController = controller;
-      lastIssuer = issuer;
-      revealAddKeySection();
-      revealLwsAuthSection();
-    } else {
-      hideAddKeySection();
-      hideLwsAuthSection();
-    }
-  } catch (err) {
-    renderChecks([{
-      status: 'fail',
-      label: 'Diagnostics crashed',
-      detail: String(err?.message || err),
-    }]);
-    hideAddKeySection();
-  } finally {
-    button.disabled = false;
-    button.textContent = 'Run diagnostics';
-  }
-});
-
-async function runAll(webIdUrl) {
-  const checks = [];
-  const result = { checks, profileFetched: false, docUrl: null, webId: null, controller: null };
-
-  // 1. Resolve the document URL — strip the fragment.
-  let docUrl;
-  try {
-    docUrl = new URL(webIdUrl);
-    docUrl.hash = '';
-  } catch (err) {
-    checks.push({ status: 'fail', label: 'WebID is a valid URL', detail: err.message });
-    return result;
-  }
-  checks.push({ status: 'pass', label: 'WebID is a valid URL', detail: docUrl.toString() });
-
-  // 2. Fetch as JSON-LD. We avoid Accept: text/turtle so the conneg layer
-  //    doesn't transform the document — we want to validate the JSON-LD
-  //    representation directly.
-  let res, contentType;
-  try {
-    res = await fetch(docUrl.toString(), {
-      headers: { 'Accept': 'application/ld+json' },
-    });
-    contentType = (res.headers.get('content-type') || '').toLowerCase();
-  } catch (err) {
-    checks.push({ status: 'fail', label: 'Profile is reachable', detail: err.message });
-    return result;
-  }
-
-  if (!res.ok) {
-    checks.push({
-      status: 'fail',
-      label: 'Profile is reachable',
-      detail: `HTTP ${res.status} from ${docUrl}`,
-    });
-    return result;
-  }
-  checks.push({
-    status: 'pass',
-    label: 'Profile is reachable',
-    detail: `${res.status} ${res.statusText}`,
-  });
-
-  if (!contentType.includes('json')) {
-    checks.push({
-      status: 'warn',
-      label: 'Content-Type is JSON-LD',
-      detail: `Got "${contentType || '(none)'}" — wanted application/ld+json. Server may not honor Accept; we'll try parsing anyway.`,
-    });
-  } else {
-    checks.push({
-      status: 'pass',
-      label: 'Content-Type is JSON-LD',
-      detail: contentType,
-    });
-  }
-
-  // 3. Parse JSON.
-  const text = await res.text();
-  rawEl.textContent = text;
-  let profile;
-  try {
-    profile = JSON.parse(text);
-  } catch (err) {
-    checks.push({
-      status: 'fail',
-      label: 'Profile parses as JSON',
-      detail: err.message,
-    });
-    return result;
-  }
-  // JSON.parse accepts null, primitives, and arrays — none of which are
-  // a usable JSON-LD profile document. Bail out before downstream code
-  // tries to read `@id`/`controller` and throws.
-  if (profile === null || typeof profile !== 'object' || Array.isArray(profile)) {
-    checks.push({
-      status: 'fail',
-      label: 'Profile parses as JSON',
-      detail: `Top-level value is ${profile === null ? 'null' : Array.isArray(profile) ? 'an array' : typeof profile}; expected a JSON object.`,
-    });
-    return result;
-  }
-  checks.push({ status: 'pass', label: 'Profile parses as JSON' });
-
-  // Profile was fetched and parsed — safe to root a snippet against this URL.
-  // Take the canonical WebID from the profile's own @id (absolutized
-  // against the document URL), but only when its fragmentless form
-  // matches the URL we actually fetched — otherwise the snippet's VM
-  // id would be rooted at one document while the UI tells the user to
-  // patch a different one. Untrusted input, so the URL parse is
-  // wrapped: malformed @id falls back to the user-supplied URL.
-  const profileId = profile['@id'] || profile.id;
-  let canonicalWebId = webIdUrl;
-  if (profileId) {
-    try {
-      const resolved = new URL(profileId, docUrl);
-      const resolvedNoHash = new URL(resolved);
-      resolvedNoHash.hash = '';
-      if (resolvedNoHash.toString() === docUrl.toString()) {
-        canonicalWebId = resolved.toString();
-      }
-    } catch {
-      // malformed @id; fall through to user-supplied URL
-    }
-  }
-  // Derive the controller IRI from the profile's declared `controller`
-  // (handling all four JSON-LD shapes), falling back to the canonical
-  // WebID when controller is absent. Generated VMs use this so that on
-  // delegated-control profiles the snippet matches the profile's own
-  // controller predicate (and passes the validator).
-  const declaredCtrls = normalizeControllers(profile.controller, docUrl.toString());
-  const controllerIri = declaredCtrls[0] ?? canonicalWebId;
-
-  result.profileFetched = true;
-  result.docUrl = docUrl.toString();
-  result.webId = canonicalWebId;
-  result.controller = controllerIri;
-  result.issuer = extractIssuer(profile);
-
-  // 4. Run LWS-CID structural checks.
-  for (const c of runLwsCidChecks(profile, { webIdUrl })) {
-    checks.push(c);
-  }
-
-  return result;
-}
-
-// --- B.2: connect Nostr signer & compute Multikey VM -----------------
-
-function revealAddKeySection() {
-  addKeySection.hidden = false;
-  // The WebID may have changed since the section was last shown; clear
-  // any prior pubkey/snippet so the user can't accidentally copy a
-  // snippet rooted at the previous WebID.
-  clearSignerOutput();
-  detectSigner();
-}
-
-function hideAddKeySection() {
-  addKeySection.hidden = true;
-  clearSignerOutput();
-  lastWebId = null;
-  lastDocUrl = null;
-  lastController = null;
-}
-
-function clearSignerOutput() {
-  signerOutput.hidden = true;
-  pubkeyHexEl.textContent = '';
-  pubkeyMbEl.textContent = '';
-  snippetEl.textContent = '';
-  snippetTarget.textContent = '';
-  connectButton.textContent = 'Connect signer';
-  copyStatus.textContent = '';
-  copyStatus.className = 'copy-status';
-}
-
-function detectSigner() {
-  if (typeof window.nostr?.getPublicKey === 'function') {
-    setSignerStatus('ready', 'NIP-07 signer detected (window.nostr).');
-    connectButton.disabled = false;
-  } else {
-    setSignerStatus('absent',
-      'No NIP-07 signer found. Install xlogin or another window.nostr provider, then reload.');
-    connectButton.disabled = true;
-  }
-}
-
-function setSignerStatus(state, text) {
-  signerStatus.className = `signer-status ${state}`;
-  signerStatus.querySelector('.text').textContent = text;
-}
-
-connectButton.addEventListener('click', async () => {
-  if (!lastWebId) return;
-  // Re-check presence: a NIP-07 provider can be uninstalled or
-  // disabled between detection and click. Throwing a raw TypeError
-  // from `window.nostr.getPublicKey()` would surface a confusing
-  // error.
-  if (typeof window.nostr?.getPublicKey !== 'function') {
-    setSignerStatus('absent',
-      'No NIP-07 signer found. Install xlogin or another window.nostr provider, then reload.');
-    connectButton.disabled = true;
-    return;
-  }
-  connectButton.disabled = true;
-  connectButton.textContent = 'Connecting…';
-  try {
-    const xOnlyHex = await window.nostr.getPublicKey();
-    if (!/^[0-9a-f]{64}$/i.test(xOnlyHex)) {
-      throw new Error(`Signer returned an unexpected pubkey: ${xOnlyHex}`);
-    }
-    renderSnippet(xOnlyHex, lastWebId, lastDocUrl, lastController);
-    signerOutput.hidden = false;
-    setSignerStatus('ready', 'Connected. The snippet below is ready to paste into your profile.');
-    connectButton.textContent = 'Reconnect signer';
-  } catch (err) {
-    clearSignerOutput();
-    setSignerStatus('error', `Could not read pubkey: ${err.message || err}`);
-  } finally {
-    connectButton.disabled = false;
-  }
-});
-
-function renderSnippet(xOnlyHex, webId, docUrl, controller) {
-  const vm = buildNostrVerificationMethod({ webId, xOnlyHex, controller });
-  pubkeyHexEl.textContent = xOnlyHex;
-  pubkeyMbEl.textContent  = vm.publicKeyMultibase;
-  // Write target is the document URL (no fragment) — you can't PUT/PATCH
-  // a fragment URI. The VM's `controller` keeps the WebID-with-fragment.
-  snippetTarget.textContent = docUrl;
-
-  // Show the three additions a CID v1 profile needs together: the
-  // verificationMethod itself, plus authentication / assertionMethod
-  // arrays referencing it. JSON-LD doesn't have "patch" syntax, so we
-  // present it as a partial document the user can merge manually.
-  const partial = {
-    verificationMethod: [vm],
-    authentication: [vm.id],
-    assertionMethod: [vm.id],
-  };
-  snippetEl.textContent = JSON.stringify(partial, null, 2);
-}
-
-copyButton.addEventListener('click', async () => {
-  try {
-    await navigator.clipboard.writeText(snippetEl.textContent);
-    copyStatus.className = 'copy-status success';
-    copyStatus.textContent = 'Copied.';
-  } catch (err) {
-    copyStatus.className = 'copy-status error';
-    copyStatus.textContent = `Couldn't copy: ${err.message || err}`;
-  }
-  setTimeout(() => {
-    copyStatus.textContent = '';
-    copyStatus.className = 'copy-status';
-  }, 2500);
-});
-
-// --- B.3: strict LWS-CID auth (Solid-OIDC sign-in + ES256K JWT) ----
-
-const lwsAuthSection  = document.getElementById('lws-auth');
-const oidcStatusEl    = document.getElementById('oidc-status');
-const oidcSignInBtn   = document.getElementById('oidc-signin');
-const oidcSignOutBtn  = document.getElementById('oidc-signout');
-const patchSection    = document.getElementById('patch-section');
-const privkeyInput    = document.getElementById('privkey');
-const patchButton     = document.getElementById('patch-button');
-const patchResult     = document.getElementById('patch-result');
-const testSection     = document.getElementById('test-section');
-const testButton      = document.getElementById('test-button');
-const testResult      = document.getElementById('test-result');
+// ---------- Solid-OIDC session (one per page) ----------
 
 const session = new Session({
   onStateChange: (e) => {
-    const isActive = e?.detail?.isActive;
-    const webId = e?.detail?.webId;
-    setOidcStatus(isActive ? 'signed-in' : null,
-      isActive ? `Signed in as ${webId}` : 'Not signed in.');
-    oidcSignInBtn.hidden = !!isActive;
-    oidcSignOutBtn.hidden = !isActive;
-    patchSection.hidden = !isActive;
-    if (!isActive) {
-      // Drop any pasted privkey + cached VM kid the moment the session
-      // ends. The UI promises sign-out clears state, and a privkey
-      // sitting in a tab that's no longer authenticated is just
-      // exposure with no purpose.
-      clearMemPrivKey();
-      lastVmKid = null;
-      privkeyInput.value = '';
-      testSection.hidden = true;
-      patchResult.textContent = '';
-      patchResult.className = 'patch-result';
-      testResult.textContent = '';
-      testResult.className = 'test-result';
-    }
+    const active = !!e?.detail?.isActive;
+    el.sessionWebId.textContent = active ? e.detail.webId : 'nobody';
+    el.signout.hidden = !active;
   },
 });
-
-// Restore any prior session (saved in IndexedDB by solid-oidc) and
-// handle the redirect-back from the IdP if we just landed on one.
-session.restore().catch(() => { /* no prior session — fine */ });
-session.handleRedirectFromLogin().catch((err) => {
-  setOidcStatus('error', `Sign-in callback failed: ${err.message || err}`);
-});
-
-function setOidcStatus(state, text) {
-  oidcStatusEl.className = `oidc-status${state ? ' ' + state : ''}`;
-  oidcStatusEl.querySelector('.text').textContent = text;
-}
-
-function revealLwsAuthSection() {
-  lwsAuthSection.hidden = false;
-  // Only enable sign-in if we have an issuer to point at.
-  oidcSignInBtn.disabled = !lastIssuer;
-  // If a session was restored from IndexedDB the user is already
-  // authenticated — don't clobber the signed-in status with a
-  // pre-login warning. The "no issuer" message only matters before
-  // we have a session.
-  if (!lastIssuer && !session.isActive) {
-    setOidcStatus('error',
-      'Profile declares no oidcIssuer — cannot start a Solid-OIDC sign-in.');
-  }
-}
-
-function hideLwsAuthSection() {
-  lwsAuthSection.hidden = true;
-  patchResult.textContent = '';
-  patchResult.className = 'patch-result';
-  testResult.textContent = '';
-  testResult.className = 'test-result';
-  testSection.hidden = true;
-  clearMemPrivKey();
-  lastVmKid = null;
-  // Clear the input element too — the in-memory privkey is gone but a
-  // pasted value would otherwise persist in the DOM across diagnostic
-  // re-runs / WebID switches and could be accidentally reused on a
-  // different identity.
-  privkeyInput.value = '';
-}
-
-oidcSignInBtn.addEventListener('click', async () => {
-  if (!lastIssuer) return;
-  try {
-    // Persist current target across the redirect — strip any login
-    // params on the way back.
-    const returnUrl = `${window.location.pathname}?webid=${encodeURIComponent(lastWebId)}`;
-    await session.login(lastIssuer, new URL(returnUrl, window.location.origin).toString());
-  } catch (err) {
-    setOidcStatus('error', `Could not start sign-in: ${err.message || err}`);
-  }
-});
-
-oidcSignOutBtn.addEventListener('click', async () => {
-  try {
-    await session.logout();
-  } catch (err) {
-    setOidcStatus('error', `Sign-out failed: ${err.message || err}`);
-  }
-});
-
-patchButton.addEventListener('click', async () => {
-  patchResult.className = 'patch-result info';
-  patchResult.textContent = 'Working…';
-  try {
-    if (!session.isActive) throw new Error('not signed in');
-    if (!session.webId) throw new Error('signed-in session has no webId');
-    if (session.webId !== lastWebId) {
-      throw new Error(
-        `signed-in WebID (${session.webId}) doesn't match the diagnosed one (${lastWebId})`);
-    }
-    const priv = validatePrivKey(privkeyInput.value);
-    memPrivKey = priv;
-
-    // Read-modify-write: GET via authFetch (so we see the
-    // authoritative current state, including any private triples),
-    // merge our VM into verificationMethod / authentication, PUT back.
-    const getRes = await session.authFetch(lastDocUrl, {
-      headers: { Accept: 'application/ld+json' },
-    });
-    if (!getRes.ok) throw new Error(`GET profile: HTTP ${getRes.status}`);
-    const etag = getRes.headers.get('etag');
-    // Validate Content-Type before JSON.parse so a Turtle (or HTML
-    // error page) response gives a clear actionable message rather
-    // than a generic "Unexpected token in JSON" SyntaxError.
-    const ct = (getRes.headers.get('content-type') || '').toLowerCase();
-    const body = await getRes.text();
-    if (!ct.includes('json')) {
-      throw new Error(
-        `profile GET returned Content-Type "${ct || '(none)'}" — expected JSON-LD. ` +
-        `First bytes: ${body.slice(0, 80).replace(/\s+/g, ' ')}`,
-      );
-    }
-    let current;
-    try {
-      current = JSON.parse(body);
-    } catch (err) {
-      throw new Error(`profile body is not valid JSON: ${err.message}`);
-    }
-
-    // Pick a fragment that's either unused or already holds the same
-    // key (idempotent re-run). Re-running with a different key won't
-    // silently clobber an existing one — we walk lws-key-N until we
-    // find a free or matching slot.
-    const { fragment, vm, kid } = chooseFragmentAndBuildVm({
-      privKey: priv,
-      profile: current,
-      webId: lastWebId,
-      controller: lastController ?? lastWebId,
-    });
-    lastVmKid = kid;
-
-    const merged = mergeVerificationMethod(current, vm);
-
-    const putHeaders = { 'Content-Type': 'application/ld+json' };
-    // Use If-Match to defeat lost-update on concurrent edits. JSS
-    // returns ETags on profile resources; servers without ETag support
-    // fall through with no header.
-    if (etag) putHeaders['If-Match'] = etag;
-
-    const putRes = await session.authFetch(lastDocUrl, {
-      method: 'PUT',
-      headers: putHeaders,
-      body: JSON.stringify(merged, null, 2),
-    });
-    if (putRes.status === 412 || putRes.status === 409) {
-      throw new Error(
-        `profile changed since GET (HTTP ${putRes.status}). Re-run diagnostics and try again.`,
-      );
-    }
-    if (!putRes.ok) throw new Error(`PUT profile: HTTP ${putRes.status}`);
-
-    patchResult.className = 'patch-result ok';
-    patchResult.textContent =
-      `Added ${kid} to verificationMethod and authentication ` +
-      `(fragment chosen: #${fragment}).\n` +
-      `Profile updated. You can now test LWS-CID auth below.`;
-    testSection.hidden = false;
-    privkeyInput.value = '';
-  } catch (err) {
-    patchResult.className = 'patch-result error';
-    patchResult.textContent = `Failed: ${err.message || err}`;
-    // Reset everything that depended on the patch having succeeded.
-    // Otherwise a UI that already showed the test section from a
-    // prior successful run would still claim "ready to test" with a
-    // stale kid against a now-uncertain server state.
-    clearMemPrivKey();
-    lastVmKid = null;
-    testSection.hidden = true;
-    testResult.textContent = '';
-    testResult.className = 'test-result';
-  }
-});
-
-testButton.addEventListener('click', async () => {
-  testResult.className = 'test-result info';
-  testResult.textContent = 'Signing JWT and calling pod…';
-  try {
-    if (!memPrivKey) throw new Error('no privkey in memory — re-run the PATCH step');
-    if (!lastVmKid)  throw new Error('no VM id captured — re-run the PATCH step');
-
-    const audience = new URL(lastDocUrl).origin;
-    const jwt = await signLwsCidJwt({
-      privKey: memPrivKey,
-      kid: lastVmKid,
-      webId: lastWebId,
-      audience,
-    });
-
-    // Hit the WebID's own resource. The doctor's plain `fetch` (NOT
-    // session.authFetch) so the only auth on the wire is the JWT we
-    // just minted — that's what we want to test.
-    const res = await fetch(lastDocUrl, {
-      headers: {
-        Accept: 'application/ld+json',
-        Authorization: `Bearer ${jwt}`,
-      },
-    });
-
-    const wacAllow = res.headers.get('wac-allow') || '(none)';
-    const summary = [
-      `Status: ${res.status} ${res.statusText}`,
-      `WAC-Allow: ${wacAllow}`,
-      '',
-      `JWT (truncated): ${jwt.slice(0, 80)}…`,
-    ].join('\n');
-
-    if (res.ok) {
-      testResult.className = 'test-result ok';
-      testResult.textContent = `LWS10-CID auth round-trip OK!\n\n${summary}`;
-    } else {
-      // Even on 4xx the response can carry useful diagnostics in the body.
-      const body = await res.text().catch(() => '');
-      testResult.className = 'test-result error';
-      testResult.textContent =
-        `Pod rejected the JWT.\n\n${summary}\n\nResponse body:\n${body.slice(0, 500)}`;
-    }
-  } catch (err) {
-    testResult.className = 'test-result error';
-    testResult.textContent = `Failed: ${err.message || err}`;
-  }
-});
-
-/**
- * Choose a non-colliding fragment for the new VM, then build it.
- *
- * - If `lws-key-1` is unused, take it.
- * - If `lws-key-1` already holds *the same* public key (re-run), take
- *   it — the merge will be a no-op replace.
- * - Otherwise walk lws-key-2, lws-key-3, … until we find an unused
- *   slot or one that already matches. Cap at 99 to bound work; if a
- *   user has somehow accumulated 99 distinct VMs they should clean
- *   up first.
- */
-function chooseFragmentAndBuildVm({ privKey, profile, webId, controller }) {
-  const docUrl = stripHashLocal(webId);
-  const vms = Array.isArray(profile.verificationMethod) ? profile.verificationMethod
-            : profile.verificationMethod ? [profile.verificationMethod]
-            : [];
-
-  // Pre-build a VM once so we can compare its JWK against existing
-  // entries. The fragment will be re-stamped on the chosen one below.
-  // (buildEs256kVerificationMethod returns { vm, jwk, kid } — the JWK
-  // sits on .jwk, not .publicKeyJwk.)
-  const probe = buildEs256kVerificationMethod({ privKey, webId, controller, fragment: 'probe' });
-  const probeJwk = probe.jwk;
-
-  for (let n = 1; n <= 99; n++) {
-    const candidateId = `${docUrl}#lws-key-${n}`;
-    const existing = vms.find((v) => entryMatchesId(v, candidateId, docUrl));
-    if (!existing) {
-      const result = buildEs256kVerificationMethod({
-        privKey, webId, controller, fragment: `lws-key-${n}`,
-      });
-      return { fragment: `lws-key-${n}`, vm: result.vm, kid: result.kid };
-    }
-    // Slot taken — only re-use if the existing entry has the SAME
-    // public-key material (idempotent re-run).
-    if (typeof existing === 'object' && existing !== null) {
-      const existingJwk = existing.publicKeyJwk;
-      if (existingJwk && sameJwk(existingJwk, probeJwk)) {
-        const result = buildEs256kVerificationMethod({
-          privKey, webId, controller, fragment: `lws-key-${n}`,
-        });
-        return { fragment: `lws-key-${n}`, vm: result.vm, kid: result.kid };
-      }
-      // Different key here — try the next slot.
-    } else {
-      // String-IRI entry takes the slot but carries no key material.
-      // We can't tell whether it's "ours" or someone else's. Skip to
-      // the next slot to be safe.
-    }
-  }
-  throw new Error('all lws-key-1..99 fragments are taken — clean up your profile first');
-}
-
-/**
- * Merge a verificationMethod entry into a profile.
- *
- * Idempotent on re-runs: when the entry's id matches an existing VM,
- * replaces it. (chooseFragmentAndBuildVm guarantees same-id ⇒ same-key
- * before we get here, so this can't silently clobber.)
- *
- * Handles string-IRI verificationMethod entries (which JSON-LD
- * permits) — finds them by IRI equality so the entry isn't duplicated.
- */
-function mergeVerificationMethod(profile, vm) {
-  const out = { ...profile };
-  const baseUrl = stripHashLocal(vm.id);
-  const vms = Array.isArray(out.verificationMethod) ? [...out.verificationMethod]
-            : out.verificationMethod ? [out.verificationMethod]
-            : [];
-  const idx = vms.findIndex((v) => entryMatchesId(v, vm.id, baseUrl));
-  if (idx >= 0) vms[idx] = vm;
-  else vms.push(vm);
-  out.verificationMethod = vms;
-
-  const auth = Array.isArray(out.authentication) ? [...out.authentication]
-             : out.authentication ? [out.authentication]
-             : [];
-  // De-dupe against the absolutized form so a pre-existing relative
-  // entry like "#lws-key-1" is recognized as the same as the absolute
-  // URI we're about to push.
-  const exists = auth.some((a) => {
-    const raw = typeof a === 'string' ? a : (a?.['@id'] || a?.id);
-    if (typeof raw !== 'string') return false;
-    return absolutizeLocal(raw, baseUrl) === vm.id;
-  });
-  if (!exists) auth.push(vm.id);
-  out.authentication = auth;
-  return out;
-}
-
-function entryMatchesId(entry, id, baseUrl) {
-  // Handle relative IRIs the way JSON-LD does: resolve against the
-  // document URL before comparing. This lets us recognize existing
-  // entries written as "#lws-key-1" as equivalent to the absolute
-  // form we generate.
-  const resolve = (s) => (typeof s === 'string' ? absolutizeLocal(s, baseUrl) : s);
-  if (typeof entry === 'string') return resolve(entry) === resolve(id);
-  if (entry && typeof entry === 'object') {
-    const raw = entry.id || entry['@id'];
-    return typeof raw === 'string' && resolve(raw) === resolve(id);
-  }
+await session.restore().catch(() => {});
+const resumed = await session.handleRedirectFromLogin().then(() => true, (err) => {
+  step('fail', 'Signing in to the pod', String(err.message || err));
   return false;
+});
+
+// ---------- Inputs ----------
+
+const params = new URLSearchParams(location.search);
+el.pod.value = params.get('webid') || params.get('pod') || sessionStorage.getItem('doctor:pod') || '';
+const signerFound = typeof window.nostr?.getPublicKey === 'function';
+el.signer.className = `signer ${signerFound ? 'ok' : 'missing'}`;
+el.signer.querySelector('.text').innerHTML = signerFound
+  ? 'Nostr signer found (NIP-07).'
+  : 'No Nostr signer in this browser. Install <a href="https://github.com/JavaScriptSolidServer/podkey" target="_blank" rel="noopener">podkey</a> (or any NIP-07 extension), then reload.';
+el.go.disabled = !signerFound;
+
+el.form.addEventListener('submit', (e) => {
+  e.preventDefault();
+  run();
+});
+el.again.addEventListener('click', () => run());
+el.signout.addEventListener('click', () => session.logout().catch(() => {}));
+// Back from the identity provider: carry on where we left off.
+if (resumed && session.isActive && sessionStorage.getItem('doctor:pending') && el.pod.value) run();
+
+// ---------- The task ----------
+
+
+function step(status, label, detail) {
+  el.steps.hidden = false;
+  const li = document.createElement('li');
+  li.innerHTML = '<span class="icon"></span><div class="body"><div class="label"></div><div class="detail"></div></div>';
+  li.querySelector('.label').textContent = label;
+  el.steps.appendChild(li);
+  const set = (newStatus, newDetail) => {
+    li.className = `step ${newStatus}`;
+    li.querySelector('.icon').textContent = ICONS[newStatus] ?? '?';
+    const d = li.querySelector('.detail');
+    d.textContent = newDetail ?? '';
+    d.hidden = !newDetail;
+  };
+  set(status, detail);
+  return set;
 }
 
-function absolutizeLocal(u, base) {
-  if (!u) return u;
-  try { return new URL(u, base).toString(); } catch { return u; }
-}
+let profileCache = null; // the last profile fetched: { webId, docUrl, profile, raw, issuer, controller }
 
-function sameJwk(a, b) {
-  // Compare the public-key material, not auxiliary fields like `kid`,
-  // `alg`, or `use`. Two VMs are "the same key" iff x and y match.
-  return a && b
-    && a.kty === b.kty
-    && a.crv === b.crv
-    && a.x === b.x
-    && a.y === b.y;
-}
-
-function stripHashLocal(u) {
+async function run() {
+  const input = el.pod.value.trim();
+  if (!input) return;
+  sessionStorage.setItem('doctor:pod', input);
+  history.replaceState(null, '', `${location.pathname}?webid=${encodeURIComponent(input)}`);
+  el.steps.innerHTML = '';
+  el.done.hidden = true;
+  el.go.disabled = true;
   try {
-    const url = new URL(u);
-    url.hash = '';
-    return url.toString();
-  } catch {
-    return String(u).split('#')[0];
+    // 1. The profile.
+    const finding = step('busy', 'Finding your profile');
+    let found;
+    try {
+      found = await findProfile(input);
+    } catch (err) {
+      return finding('fail', err.message);
+    }
+    profileCache = found;
+    finding('pass', found.webId);
+
+    // 2. Signed in to that pod?
+    if (!session.isActive || session.webId !== found.webId) {
+      if (!found.issuer) return step('fail', 'Signing in to the pod', 'This profile names no sign-in service (solid:oidcIssuer), so doctor cannot write to it. Ask the pod provider, or add the key to the profile by hand.');
+      step('busy', 'Signing in to the pod', `Going to ${found.issuer} and coming back here.`);
+      sessionStorage.setItem('doctor:pending', '1');
+      await session.login(found.issuer, `${location.origin}${location.pathname}?webid=${encodeURIComponent(input)}`);
+      return; // the page navigates away
+    }
+    sessionStorage.removeItem('doctor:pending');
+    step('pass', 'Signed in to the pod', `as ${session.webId}`);
+
+    // 3. The key.
+    if (typeof window.nostr?.getPublicKey !== 'function') return step('fail', 'Reading your Nostr key', 'No NIP-07 signer in this browser.');
+    const pubkey = String(await window.nostr.getPublicKey()).toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) return step('fail', 'Reading your Nostr key', `The signer returned something that is not a key: ${pubkey}`);
+    step('pass', 'Reading your Nostr key', `did:nostr:${pubkey}`);
+
+    // 4. Write it into the profile (idempotent: an existing method with the same key is kept).
+    const writing = step('busy', 'Adding the key to your profile');
+    let outcome;
+    try {
+      outcome = await addKeyToProfile(found, pubkey);
+    } catch (err) {
+      return writing('fail', err.message);
+    }
+    writing('pass', outcome.existing ? `Already there as ${outcome.vmId}` : `Added as ${outcome.vmId}`);
+
+    // 5. Prove it: a NIP-98-signed request to the pod must come back as the owner.
+    const proving = step('busy', 'Checking the pod recognises the key');
+    try {
+      const allow = await proveWithNip98(found.docUrl);
+      if (/\b(write|control)\b/.test(allow.user)) proving('pass', `A request signed with this key is answered as you (WAC-Allow user="${allow.user}").`);
+      else proving('warn', `The pod answered, but as a stranger (WAC-Allow user="${allow.user || 'none'}"). Some pods cache profiles briefly; try "Check again" in a minute.`);
+    } catch (err) {
+      proving('warn', `Could not verify: ${err.message}. The key is in your profile; a pod that understands NIP-98 will accept it.`);
+    }
+
+    el.doneDid.textContent = `did:nostr:${pubkey}`;
+    el.doneWebId.textContent = found.webId;
+    el.done.hidden = false;
+  } finally {
+    el.go.disabled = !signerFound;
   }
 }
 
-function extractIssuer(profile) {
-  // JSS emits oidcIssuer in compact form via the profile @context. Some
-  // clients use the full predicate URI or the prefixed form; support
-  // all. The value can also be an array (JSON-LD permits it for any
-  // predicate) — take the first usable entry.
-  const raw = profile?.oidcIssuer
-           ?? profile?.['solid:oidcIssuer']
-           ?? profile?.['http://www.w3.org/ns/solid/terms#oidcIssuer'];
-  if (raw === null || raw === undefined) return null;
-  const list = Array.isArray(raw) ? raw : [raw];
-  for (const v of list) {
-    if (typeof v === 'string') return v;
-    if (v && typeof v === 'object') {
-      const id = v['@id'] || v.id;
-      if (typeof id === 'string') return id;
+// The WebID profile behind a WebID or a pod address. Pods put the profile at a few
+// conventional places; a WebID is used as given.
+async function findProfile(input) {
+  let url;
+  try {
+    url = new URL(input);
+  } catch {
+    throw new Error('That is not a web address.');
+  }
+  const root = url.href.replace(/\/?$/, '/');
+  const candidates = url.hash || /profile\/card/.test(url.pathname)
+    ? [url.href]
+    : [`${root}profile/card#me`, `${root}profile/card.jsonld#me`, `${url.origin}/profile/card#me`, `${url.origin}/profile/card.jsonld#me`, `${url.origin}/#me`];
+  let lastError = 'No profile found at that address.';
+  for (const webId of candidates) {
+    const docUrl = webId.split('#')[0];
+    let res;
+    try {
+      res = await fetch(docUrl, { headers: { Accept: 'application/ld+json' }, cache: 'no-store' });
+    } catch (err) {
+      lastError = `${docUrl}: ${err.message}`;
+      continue;
     }
+    if (!res.ok) {
+      lastError = `${docUrl}: HTTP ${res.status}`;
+      continue;
+    }
+    const text = await res.text();
+    let profile;
+    try {
+      profile = JSON.parse(text);
+    } catch {
+      lastError = `${docUrl} is not JSON-LD (the pod must serve the profile as application/ld+json).`;
+      continue;
+    }
+    if (!profile || typeof profile !== 'object' || Array.isArray(profile)) continue;
+    // Prefer the profile's own @id when it lives in this document.
+    let resolved = webId;
+    const own = profile['@id'] ?? profile.id;
+    if (typeof own === 'string') {
+      try {
+        const abs = new URL(own, docUrl);
+        if (abs.href.split('#')[0] === docUrl) resolved = abs.href;
+      } catch {}
+    }
+    const controller = normalizeControllers(profile.controller, docUrl)[0] ?? resolved;
+    return { webId: resolved, docUrl, profile, raw: text, issuer: issuerOf(profile), controller };
+  }
+  throw new Error(lastError);
+}
+
+function issuerOf(profile) {
+  const raw = profile.oidcIssuer ?? profile['solid:oidcIssuer'] ?? profile['http://www.w3.org/ns/solid/terms#oidcIssuer'];
+  for (const v of Array.isArray(raw) ? raw : [raw]) {
+    if (typeof v === 'string') return v;
+    const id = v?.['@id'] ?? v?.id;
+    if (typeof id === 'string') return id;
   }
   return null;
 }
 
+const absolute = (u, base) => { try { return new URL(u, base).href; } catch { return u; } };
+const idOf = (entry) => (typeof entry === 'string' ? entry : entry?.id ?? entry?.['@id']);
+const asList = (v) => (Array.isArray(v) ? v : v ? [v] : []);
+
+// Read the live profile with the session: { current, etag }.
+async function readLive(found) {
+  const res = await session.authFetch(found.docUrl, { headers: { Accept: 'application/ld+json' } });
+  if (!res.ok) throw new Error(`Reading the profile failed: HTTP ${res.status}`);
+  return { current: JSON.parse(await res.text()), etag: res.headers.get('etag') };
+}
+
+// Merge a verificationMethod plus its `authentication` reference into the live profile
+// and PUT it back (If-Match when the pod gives an ETag). Shared by the Nostr key and the
+// advanced JWK path.
+async function writeMethod(found, vm) {
+  const { current, etag } = await readLive(found);
+  const vms = [...asList(current.verificationMethod)];
+  const at = vms.findIndex((v) => absolute(idOf(v), found.docUrl) === vm.id);
+  if (at >= 0) vms[at] = vm;
+  else vms.push(vm);
+  const auth = [...asList(current.authentication)];
+  if (!auth.some((a) => absolute(idOf(a), found.docUrl) === vm.id)) auth.push(vm.id);
+  const put = await session.authFetch(found.docUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/ld+json', ...(etag ? { 'If-Match': etag } : {}) },
+    body: JSON.stringify({ ...current, verificationMethod: vms, authentication: auth }, null, 2),
+  });
+  if (put.status === 412 || put.status === 409) throw new Error('The profile changed while doctor was working. Try again.');
+  if (put.status === 401 || put.status === 403) throw new Error('The pod did not let this session write the profile. Are you signed in as its owner?');
+  if (!put.ok) throw new Error(`Writing the profile failed: HTTP ${put.status}`);
+}
+
+// Reuse the method that already holds this key; otherwise take the first free #nostr-key-N.
+async function addKeyToProfile(found, pubkey) {
+  const { current } = await readLive(found);
+  const vms = asList(current.verificationMethod);
+  const auth = asList(current.authentication);
+  for (const v of vms) {
+    const decoded = typeof v === 'object' && v?.publicKeyMultibase ? multikeyToNostrPubkey(v.publicKeyMultibase) : null;
+    if (decoded?.xOnlyHex !== pubkey) continue;
+    const vmId = absolute(idOf(v), found.docUrl);
+    if (auth.some((a) => absolute(idOf(a), found.docUrl) === vmId)) return { vmId, existing: true };
+    await writeMethod(found, { ...v, id: vmId }); // known key, not yet usable for authentication
+    return { vmId, existing: false };
+  }
+  const taken = new Set(vms.map((v) => absolute(idOf(v), found.docUrl)));
+  let n = 1;
+  while (taken.has(`${found.docUrl}#nostr-key-${n}`)) n++;
+  const vm = buildNostrVerificationMethod({ webId: found.webId, xOnlyHex: pubkey, controller: found.controller, fragment: `nostr-key-${n}` });
+  await writeMethod(found, vm);
+  return { vmId: vm.id, existing: false };
+}
+
+// A HEAD of the profile document with a NIP-98 header; WAC-Allow says who the pod thinks we are.
+async function proveWithNip98(url) {
+  const event = await window.nostr.signEvent({
+    kind: 27235,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [['u', url], ['method', 'HEAD']],
+    content: '',
+  });
+  const token = btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(event))));
+  const res = await fetch(url, { method: 'HEAD', headers: { Authorization: `Nostr ${token}` }, cache: 'no-store' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const header = res.headers.get('WAC-Allow') ?? '';
+  return { user: header.match(/user="([^"]*)"/)?.[1] ?? '', public: header.match(/public="([^"]*)"/)?.[1] ?? '' };
+}
+
+// ---------- Advanced: profile checks ----------
+
+el.check.addEventListener('click', async () => {
+  el.checks.innerHTML = '';
+  el.checks.hidden = false;
+  el.raw.hidden = true;
+  let found;
+  try {
+    found = await findProfile(el.pod.value.trim());
+  } catch (err) {
+    return renderChecks([{ status: 'fail', label: 'Profile is reachable', detail: err.message }]);
+  }
+  profileCache = found;
+  el.rawBody.textContent = found.raw;
+  el.raw.hidden = false;
+  renderChecks([{ status: 'pass', label: 'Profile is reachable', detail: found.docUrl }, ...runLwsCidChecks(found.profile, { webIdUrl: found.webId })]);
+});
+
 function renderChecks(checks) {
-  checksEl.innerHTML = '';
   for (const c of checks) {
     const li = document.createElement('li');
-    li.className = `check ${c.status}`;
-    const symbols = { pass: '✓', warn: '!', fail: '✗', skip: '·' };
-    li.innerHTML = `
-      <span class="icon">${symbols[c.status] ?? '?'}</span>
-      <div class="body">
-        <div class="label"></div>
-        ${c.detail ? `<div class="detail"></div>` : ''}
-      </div>
-    `;
+    li.className = `step ${c.status}`;
+    li.innerHTML = '<span class="icon"></span><div class="body"><div class="label"></div><div class="detail"></div></div>';
+    li.querySelector('.icon').textContent = ICONS[c.status] ?? '?';
     li.querySelector('.label').textContent = c.label;
-    if (c.detail) li.querySelector('.detail').textContent = c.detail;
-    checksEl.appendChild(li);
+    li.querySelector('.detail').textContent = c.detail ?? '';
+    li.querySelector('.detail').hidden = !c.detail;
+    el.checks.appendChild(li);
   }
 }
+
+// ---------- Advanced: strict LWS10-CID (ES256K JWT), loaded on use ----------
+
+let memPrivKey = null;
+let jwtKid = null;
+const say = (cls, text) => {
+  el.jwtOut.hidden = false;
+  el.jwtOut.className = cls;
+  el.jwtOut.textContent = text;
+};
+
+el.jwtAdd.addEventListener('click', async () => {
+  try {
+    if (!session.isActive) throw new Error('Sign in first (connect your key above, or press "Check again").');
+    const found = profileCache?.webId === session.webId ? profileCache : await findProfile(session.webId);
+    const lws = await import('./lib/lws-cid-client.js');
+    memPrivKey = lws.validatePrivKey(el.privkey.value.trim());
+    el.privkey.value = '';
+    // Reuse the slot holding the same key; otherwise the first free lws-key-N.
+    const { current } = await readLive(found);
+    const vms = asList(current.verificationMethod);
+    const probe = lws.buildEs256kVerificationMethod({ privKey: memPrivKey, webId: found.webId, controller: found.controller, fragment: 'probe' }).jwk;
+    let n = 1;
+    for (;;) {
+      const existing = vms.find((v) => absolute(idOf(v), found.docUrl) === `${found.docUrl}#lws-key-${n}`);
+      if (!existing || (existing.publicKeyJwk?.x === probe.x && existing.publicKeyJwk?.y === probe.y)) break;
+      n++;
+    }
+    const { vm, kid } = lws.buildEs256kVerificationMethod({ privKey: memPrivKey, webId: found.webId, controller: found.controller, fragment: `lws-key-${n}` });
+    await writeMethod(found, vm);
+    jwtKid = kid;
+    say('ok', `Added ${kid} to verificationMethod and authentication.`);
+  } catch (err) {
+    memPrivKey?.fill?.(0);
+    memPrivKey = null;
+    jwtKid = null;
+    say('error', `Failed: ${err.message || err}`);
+  }
+});
+
+el.jwtTest.addEventListener('click', async () => {
+  try {
+    if (!memPrivKey || !jwtKid) throw new Error('Add the JWK method first.');
+    const lws = await import('./lib/lws-cid-client.js');
+    const docUrl = session.webId.split('#')[0];
+    const jwt = await lws.signLwsCidJwt({ privKey: memPrivKey, kid: jwtKid, webId: session.webId, audience: new URL(docUrl).origin });
+    const res = await fetch(docUrl, { headers: { Accept: 'application/ld+json', Authorization: `Bearer ${jwt}` }, cache: 'no-store' });
+    const body = res.ok ? '' : `\n\n${(await res.text().catch(() => '')).slice(0, 500)}`;
+    say(res.ok ? 'ok' : 'error', `${res.ok ? 'LWS10-CID auth round-trip OK.' : 'The pod rejected the JWT.'}\nStatus: ${res.status}\nWAC-Allow: ${res.headers.get('wac-allow') ?? '(none)'}\nJWT: ${jwt.slice(0, 80)}…${body}`);
+  } catch (err) {
+    say('error', `Failed: ${err.message || err}`);
+  }
+});

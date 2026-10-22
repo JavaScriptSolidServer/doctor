@@ -3,133 +3,85 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>doctor — Solid pod diagnostics</title>
+  <title>doctor — connect your Nostr key to your Solid pod</title>
+  <meta name="description" content="One step: sign in to your pod and it learns your Nostr key. After that, Nostr apps can write to your pod as you.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https: http://localhost:* http://127.0.0.1:*; form-action 'none'; object-src 'none'; base-uri 'none'">
+  <meta name="referrer" content="no-referrer">
   <link rel="stylesheet" href="doctor.css">
 </head>
 <body>
   <main>
     <header>
       <h1>doctor</h1>
-      <p class="tagline">Diagnostics for Solid pods and the decentralized-web stack.</p>
+      <p class="tagline">Connect your Nostr key to your Solid pod.</p>
     </header>
 
-    <section class="checker">
-      <h2>LWS / CID v1 profile shape</h2>
-      <p>Enter a WebID URL. The checker fetches it as <code>application/ld+json</code> and validates against the
-        <a href="https://www.w3.org/TR/cid-1.0/" target="_blank" rel="noopener">W3C Controlled Identifiers v1.0</a>
-        profile expected by
-        <a href="https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/" target="_blank" rel="noopener">LWS 1.0 auth</a>.</p>
+    <section class="card" id="link">
+      <p class="lead">Sign in to your pod once, and it learns your Nostr key. From then on Nostr apps such as
+        <a href="https://solid-chat.com/v2/" target="_blank" rel="noopener">Solid Chat</a> can write to your pod as you,
+        with no further sign-in. Nothing secret leaves your browser: the pod only ever sees your public key.</p>
 
-      <form id="check-form">
-        <label for="webid">WebID URL</label>
-        <input id="webid" name="webid" type="url" required
-               placeholder="https://alice.solid.social/profile/card.jsonld#me"
-               value="">
-        <button type="submit">Run diagnostics</button>
+      <form id="link-form">
+        <label for="pod">Your pod or WebID</label>
+        <input id="pod" name="pod" type="url" required autocomplete="url" spellcheck="false"
+               placeholder="https://alice.example.org/">
+        <div class="signer" id="signer" role="status" aria-live="polite">
+          <span class="dot" aria-hidden="true"></span><span class="text">Looking for a Nostr signer…</span>
+        </div>
+        <button type="submit" id="go">Connect my key</button>
       </form>
 
-      <div id="results" hidden>
-        <h3>Results</h3>
-        <ol id="checks" class="checks"></ol>
+      <ol id="steps" class="steps" hidden></ol>
 
-        <details id="raw">
-          <summary>Raw profile JSON</summary>
-          <pre id="raw-body"></pre>
-        </details>
+      <div id="done" class="done" hidden>
+        <h2>Done</h2>
+        <p>Your pod now recognises <code id="done-did"></code> as <code id="done-webid"></code>.</p>
+        <p class="actions">
+          <a class="button" id="open-chat" href="https://solid-chat.com/v2/" target="_blank" rel="noopener">Open Solid Chat</a>
+          <button type="button" id="again" class="secondary">Check again</button>
+        </p>
       </div>
     </section>
 
-    <section class="add-key" id="add-key" hidden>
-      <h2>Add a Nostr verification method</h2>
-      <p>Read your Nostr public key from a <a href="https://github.com/nostr-protocol/nips/blob/master/07.md" target="_blank" rel="noopener">NIP-07</a>
-        signer (e.g. <a href="https://xlogin.solid.social/" target="_blank" rel="noopener">xlogin</a>) and produce the
-        <code>verificationMethod</code> JSON to add to your profile. Encoding follows
-        <a href="https://nostrcg.github.io/did-nostr/" target="_blank" rel="noopener">did:nostr</a>'s Multikey recipe.
-        No keys are sent anywhere &mdash; this is a pure client-side computation.</p>
+    <details class="card advanced" id="advanced">
+      <summary>Advanced</summary>
 
-      <div class="signer-status" id="signer-status" role="status" aria-live="polite">
-        <span class="dot" aria-hidden="true"></span>
-        <span class="text">Checking for signer…</span>
-      </div>
+      <section>
+        <h2>Profile shape (LWS / CID v1)</h2>
+        <p>What the profile at the address above declares, checked against the
+          <a href="https://www.w3.org/TR/cid-1.0/" target="_blank" rel="noopener">Controlled Identifiers v1.0</a> shape that
+          <a href="https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/" target="_blank" rel="noopener">LWS 1.0 auth</a> expects.</p>
+        <button type="button" id="check">Check profile</button>
+        <ol id="checks" class="steps" hidden></ol>
+        <details id="raw" hidden><summary>Raw profile JSON</summary><pre id="raw-body"></pre></details>
+      </section>
 
-      <button type="button" id="connect-signer" disabled>Connect signer</button>
+      <section>
+        <h2>Strict LWS10-CID auth (ES256K JWT)</h2>
+        <p>For testing a pod's LWS10-CID verifier: after signing in above, paste a secp256k1 private key as 64 hex characters
+          (the raw bytes behind an <code>nsec1…</code>; it stays in this tab's memory only), add it to your profile as a
+          <code>JsonWebKey</code> method and sign a JWT with it.</p>
+        <label for="privkey">Private key (64 hex)</label>
+        <input id="privkey" type="password" autocomplete="off" spellcheck="false" placeholder="64 hex characters">
+        <p class="actions">
+          <button type="button" id="jwt-add">Add JWK method</button>
+          <button type="button" id="jwt-test" class="secondary">Sign a test JWT</button>
+        </p>
+        <pre id="jwt-out" hidden></pre>
+      </section>
 
-      <div id="signer-output" hidden>
-        <dl class="kv">
-          <dt>Nostr pubkey (hex)</dt>
-          <dd><code id="pubkey-hex"></code></dd>
-          <dt>publicKeyMultibase</dt>
-          <dd><code id="pubkey-multibase"></code></dd>
-        </dl>
-
-        <h3>Patch to apply</h3>
-        <p class="hint">Add these triples to your <code id="snippet-target"></code>. Field
-          <code>id</code> uses the <code>#nostr-key-1</code> fragment by convention &mdash; pick another
-          if it collides.</p>
-        <pre><code id="snippet"></code></pre>
-        <button type="button" id="copy-snippet">Copy snippet</button>
-        <span class="copy-status" id="copy-status" aria-live="polite"></span>
-
-        <p class="hint">For end-to-end auth without copy/paste, see "Strict LWS10-CID auth setup" below — it signs you in, writes the VM, and tests authentication for you.</p>
-      </div>
-    </section>
-
-    <section class="lws-auth" id="lws-auth" hidden>
-      <h2>Strict LWS10-CID auth setup</h2>
-      <p>Sign in to your pod, paste a secp256k1 private key as 64 hex chars (the raw
-        32-byte key behind your Nostr <code>nsec1…</code> bech32 &mdash; same key,
-        different signature scheme), and the doctor adds a
-        <code>JsonWebKey</code> verificationMethod to your profile (read-modify-write over
-        authenticated GET + PUT) and signs a real
-        <a href="https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/" target="_blank" rel="noopener">LWS10-CID</a>
-        JWT to authenticate. <strong>The private key never leaves your browser.</strong></p>
-
-      <!-- Sign-in -->
-      <div class="oidc-status" id="oidc-status" role="status" aria-live="polite">
-        <span class="dot" aria-hidden="true"></span>
-        <span class="text">Not signed in.</span>
-      </div>
-      <button type="button" id="oidc-signin">Sign in via Solid-OIDC</button>
-      <button type="button" id="oidc-signout" hidden>Sign out</button>
-
-      <!-- PATCH -->
-      <div id="patch-section" hidden>
-        <h3>1. Add an ES256K verificationMethod</h3>
-        <p class="hint">Paste your secp256k1 private key as 64 hex chars (the raw 32-byte
-          key, not a bech32 <code>nsec1…</code>). Same key used for Nostr signing — only
-          the signature scheme differs (ECDSA here vs Schnorr for Nostr events). The key
-          is held in memory for this tab only; it is never persisted.</p>
-        <label for="privkey">Private key (64 hex chars)</label>
-        <input id="privkey" name="privkey" type="password" autocomplete="off" spellcheck="false"
-               placeholder="0123…64-hex-chars…cdef">
-        <button type="button" id="patch-button">Add VM to profile</button>
-        <div class="patch-result" id="patch-result" aria-live="polite"></div>
-        <p class="hint">Implementation: authenticated GET → merge VM → PUT (with
-          <code>If-Match</code> when the server provides an ETag). True
-          <code>PATCH</code> isn't used because JSS's JSON-LD ↔ Turtle conneg
-          layer has known edge cases on patch round-trips.</p>
-      </div>
-
-      <!-- Test auth -->
-      <div id="test-section" hidden>
-        <h3>2. Sign a test JWT and authenticate</h3>
-        <p class="hint">Builds an LWS10-CID JWT signed with your privkey, hits your pod
-          with <code>Authorization: Bearer &lt;jwt&gt;</code>, and reports the verifier's
-          response.</p>
-        <button type="button" id="test-button">Test auth</button>
-        <pre class="test-result" id="test-result" aria-live="polite"></pre>
-      </div>
-    </section>
+      <section>
+        <p class="hint">Signed in via Solid-OIDC as <code id="session-webid">nobody</code>.
+          <button type="button" id="signout" class="link" hidden>Sign out</button></p>
+      </section>
+    </details>
 
     <footer>
-      <p>
-        <a href="https://github.com/JavaScriptSolidServer/doctor" target="_blank" rel="noopener">source</a>
+      <p><a href="https://github.com/JavaScriptSolidServer/doctor" target="_blank" rel="noopener">source</a>
         · <a href="https://github.com/JavaScriptSolidServer/doctor/issues" target="_blank" rel="noopener">issues</a>
-        · alpha
-      </p>
+        · no key ever leaves your browser</p>
     </footer>
   </main>
-
   <script type="module" src="doctor.js"></script>
 </body>
 </html>
