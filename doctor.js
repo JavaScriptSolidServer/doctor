@@ -44,10 +44,20 @@ const resumed = await session.handleRedirectFromLogin().then(() => true, (err) =
 
 const params = new URLSearchParams(location.search);
 el.pod.value = params.get('webid') || params.get('pod') || sessionStorage.getItem('doctor:pod') || '';
-const signerFound = typeof window.nostr?.getPublicKey === 'function';
+
+// Extensions inject window.nostr a moment after the page runs; give them two seconds.
+async function signer(timeoutMs = 2000) {
+  const until = Date.now() + timeoutMs;
+  while (typeof window.nostr?.getPublicKey !== 'function') {
+    if (Date.now() > until) return null;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return window.nostr;
+}
+const signerFound = !!(await signer());
 el.signer.className = `signer ${signerFound ? 'ok' : 'missing'}`;
 el.signer.querySelector('.text').innerHTML = signerFound
-  ? 'Nostr signer found (NIP-07).'
+  ? 'Nostr signer found (NIP-07). It will ask you to share your public key and to sign one request.'
   : 'No Nostr signer in this browser. Install <a href="https://github.com/JavaScriptSolidServer/podkey" target="_blank" rel="noopener">podkey</a> (or any NIP-07 extension), then reload.';
 el.go.disabled = !signerFound;
 
@@ -102,7 +112,22 @@ async function run() {
     profileCache = found;
     finding('pass', found.webId);
 
-    // 2. Signed in to that pod?
+    // 2. The key.
+    const nostr = await signer();
+    if (!nostr) return step('fail', 'Reading your Nostr key', 'No NIP-07 signer in this browser.');
+    const pubkey = String(await nostr.getPublicKey()).toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) return step('fail', 'Reading your Nostr key', `The signer returned something that is not a key: ${pubkey}`);
+    step('pass', 'Reading your Nostr key', `did:nostr:${pubkey}`);
+
+    // 3. Already in the (public) profile? Then nothing needs writing and no sign-in is needed.
+    const known = linkedAs(found.profile, found.docUrl, pubkey);
+    if (known) {
+      step('pass', 'Adding the key to your profile', `Already there as ${known}`);
+      await prove(found, pubkey);
+      return;
+    }
+
+    // 4. Signed in to that pod?
     if (!session.isActive || session.webId !== found.webId) {
       if (!found.issuer) return step('fail', 'Signing in to the pod', 'This profile names no sign-in service (solid:oidcIssuer), so doctor cannot write to it. Ask the pod provider, or add the key to the profile by hand.');
       step('busy', 'Signing in to the pod', `Going to ${found.issuer} and coming back here.`);
@@ -113,13 +138,7 @@ async function run() {
     sessionStorage.removeItem('doctor:pending');
     step('pass', 'Signed in to the pod', `as ${session.webId}`);
 
-    // 3. The key.
-    if (typeof window.nostr?.getPublicKey !== 'function') return step('fail', 'Reading your Nostr key', 'No NIP-07 signer in this browser.');
-    const pubkey = String(await window.nostr.getPublicKey()).toLowerCase();
-    if (!/^[0-9a-f]{64}$/.test(pubkey)) return step('fail', 'Reading your Nostr key', `The signer returned something that is not a key: ${pubkey}`);
-    step('pass', 'Reading your Nostr key', `did:nostr:${pubkey}`);
-
-    // 4. Write it into the profile (idempotent: an existing method with the same key is kept).
+    // 5. Write it into the profile (idempotent: an existing method with the same key is kept).
     const writing = step('busy', 'Adding the key to your profile');
     let outcome;
     try {
@@ -128,23 +147,38 @@ async function run() {
       return writing('fail', err.message);
     }
     writing('pass', outcome.existing ? `Already there as ${outcome.vmId}` : `Added as ${outcome.vmId}`);
-
-    // 5. Prove it: a NIP-98-signed request to the pod must come back as the owner.
-    const proving = step('busy', 'Checking the pod recognises the key');
-    try {
-      const allow = await proveWithNip98(found.docUrl);
-      if (/\b(write|control)\b/.test(allow.user)) proving('pass', `A request signed with this key is answered as you (WAC-Allow user="${allow.user}").`);
-      else proving('warn', `The pod answered, but as a stranger (WAC-Allow user="${allow.user || 'none'}"). Some pods cache profiles briefly; try "Check again" in a minute.`);
-    } catch (err) {
-      proving('warn', `Could not verify: ${err.message}. The key is in your profile; a pod that understands NIP-98 will accept it.`);
-    }
-
-    el.doneDid.textContent = `did:nostr:${pubkey}`;
-    el.doneWebId.textContent = found.webId;
-    el.done.hidden = false;
+    await prove(found, pubkey);
   } finally {
     el.go.disabled = !signerFound;
   }
+}
+
+// The last step: a NIP-98-signed request to the pod must come back as the owner.
+async function prove(found, pubkey) {
+  const proving = step('busy', 'Checking the pod recognises the key');
+  try {
+    const allow = await proveWithNip98(found.docUrl);
+    if (/\b(write|control)\b/.test(allow.user)) proving('pass', `A request signed with this key is answered as you (WAC-Allow user="${allow.user}").`);
+    else proving('warn', `The pod answered, but as a stranger (WAC-Allow user="${allow.user || 'none'}"). Some pods cache profiles briefly; try "Check again" in a minute.`);
+  } catch (err) {
+    proving('warn', `Could not verify: ${err.message}. The key is in your profile; a pod that understands NIP-98 will accept it.`);
+  }
+  el.doneDid.textContent = `did:nostr:${pubkey}`;
+  el.doneWebId.textContent = found.webId;
+  el.done.hidden = false;
+}
+
+// The id of the verificationMethod that already holds this key and is usable for
+// authentication, or null.
+function linkedAs(profile, docUrl, pubkey) {
+  const auth = asList(profile.authentication).map((a) => absolute(idOf(a), docUrl));
+  for (const v of asList(profile.verificationMethod)) {
+    const decoded = typeof v === 'object' && v?.publicKeyMultibase ? multikeyToNostrPubkey(v.publicKeyMultibase) : null;
+    if (decoded?.xOnlyHex !== pubkey) continue;
+    const id = absolute(idOf(v), docUrl);
+    if (auth.includes(id)) return id;
+  }
+  return null;
 }
 
 // The WebID profile behind a WebID or a pod address. Pods put the profile at a few
@@ -208,9 +242,10 @@ function issuerOf(profile) {
   return null;
 }
 
-const absolute = (u, base) => { try { return new URL(u, base).href; } catch { return u; } };
-const idOf = (entry) => (typeof entry === 'string' ? entry : entry?.id ?? entry?.['@id']);
-const asList = (v) => (Array.isArray(v) ? v : v ? [v] : []);
+// Hoisted: run() may start while the module is still evaluating (resuming after the redirect).
+function absolute(u, base) { try { return new URL(u, base).href; } catch { return u; } }
+function idOf(entry) { return typeof entry === 'string' ? entry : entry?.id ?? entry?.['@id']; }
+function asList(v) { return Array.isArray(v) ? v : v ? [v] : []; }
 
 // Read the live profile with the session: { current, etag }.
 async function readLive(found) {
@@ -244,12 +279,12 @@ async function writeMethod(found, vm) {
 async function addKeyToProfile(found, pubkey) {
   const { current } = await readLive(found);
   const vms = asList(current.verificationMethod);
-  const auth = asList(current.authentication);
+  const linked = linkedAs(current, found.docUrl, pubkey);
+  if (linked) return { vmId: linked, existing: true };
   for (const v of vms) {
     const decoded = typeof v === 'object' && v?.publicKeyMultibase ? multikeyToNostrPubkey(v.publicKeyMultibase) : null;
     if (decoded?.xOnlyHex !== pubkey) continue;
     const vmId = absolute(idOf(v), found.docUrl);
-    if (auth.some((a) => absolute(idOf(a), found.docUrl) === vmId)) return { vmId, existing: true };
     await writeMethod(found, { ...v, id: vmId }); // known key, not yet usable for authentication
     return { vmId, existing: false };
   }
