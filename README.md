@@ -21,9 +21,10 @@ sign-in. Nothing secret leaves the browser: the pod only ever sees the public ke
    `WAC-Allow`. [JSS](https://github.com/JavaScriptSolidServer/JavaScriptSolidServer)
    resolves such a key to the pod owner's WebID.
 
-Under **Advanced**: the read-only LWS / W3C Controlled Identifiers v1.0 profile-shape
-check, and the strict LWS10-CID test client (ES256K `JsonWebKey` method plus a signed JWT),
-loaded only when used.
+Under **Advanced**: the Nostr keys the profile accepts, each with a Remove button (for a
+lost or replaced key; pods that cache profiles take a few minutes to notice), the read-only
+LWS / W3C Controlled Identifiers v1.0 profile-shape check, and the strict LWS10-CID test
+client (ES256K `JsonWebKey` method plus a signed JWT), loaded only when used.
 
 ## Stack
 
@@ -33,6 +34,9 @@ The page's Content Security Policy allows scripts from its own origin only. Depl
 static site from the `gh-pages` branch.
 
 `?webid=…` or `?pod=…` in the URL prefills the address, so another app can link here.
+
+`npm test` runs the profile-key logic (`lib/profile-keys.js`) against fixtures; `npm run check`
+syntax-checks the modules and verifies the vendored checksums. Both run in CI.
 
 ## Refs
 

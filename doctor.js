@@ -11,8 +11,9 @@
  * unchanged from before, loaded only when used.
  */
 import { Session } from './vendor/solid-oidc.js';
-import { buildNostrVerificationMethod, multikeyToNostrPubkey } from './lib/multikey.js';
+import { buildNostrVerificationMethod } from './lib/multikey.js';
 import { runLwsCidChecks, normalizeControllers } from './lib/lws-cid.js';
+import { absolute, asList as asListed, freeFragment, idOf, linkedAs, mergeMethod, methodFor, nostrMethods, removeMethod } from './lib/profile-keys.js';
 
 const $ = (id) => document.getElementById(id);
 const el = {
@@ -21,6 +22,7 @@ const el = {
   check: $('check'), checks: $('checks'), raw: $('raw'), rawBody: $('raw-body'),
   privkey: $('privkey'), jwtAdd: $('jwt-add'), jwtTest: $('jwt-test'), jwtOut: $('jwt-out'),
   sessionWebId: $('session-webid'), signout: $('signout'),
+  keys: $('keys'), keysList: $('keys-list'), keysRefresh: $('keys-refresh'), keysNote: $('keys-note'),
 };
 
 const ICONS = { pass: '✓', warn: '!', fail: '✗', busy: '…', skip: '·' };
@@ -168,18 +170,6 @@ async function prove(found, pubkey) {
   el.done.hidden = false;
 }
 
-// The id of the verificationMethod that already holds this key and is usable for
-// authentication, or null.
-function linkedAs(profile, docUrl, pubkey) {
-  const auth = asList(profile.authentication).map((a) => absolute(idOf(a), docUrl));
-  for (const v of asList(profile.verificationMethod)) {
-    const decoded = typeof v === 'object' && v?.publicKeyMultibase ? multikeyToNostrPubkey(v.publicKeyMultibase) : null;
-    if (decoded?.xOnlyHex !== pubkey) continue;
-    const id = absolute(idOf(v), docUrl);
-    if (auth.includes(id)) return id;
-  }
-  return null;
-}
 
 // The WebID profile behind a WebID or a pod address. Pods put the profile at a few
 // conventional places; a WebID is used as given.
@@ -242,11 +232,6 @@ function issuerOf(profile) {
   return null;
 }
 
-// Hoisted: run() may start while the module is still evaluating (resuming after the redirect).
-function absolute(u, base) { try { return new URL(u, base).href; } catch { return u; } }
-function idOf(entry) { return typeof entry === 'string' ? entry : entry?.id ?? entry?.['@id']; }
-function asList(v) { return Array.isArray(v) ? v : v ? [v] : []; }
-
 // Read the live profile with the session: { current, etag }.
 async function readLive(found) {
   const res = await session.authFetch(found.docUrl, { headers: { Accept: 'application/ld+json' } });
@@ -259,16 +244,14 @@ async function readLive(found) {
 // advanced JWK path.
 async function writeMethod(found, vm) {
   const { current, etag } = await readLive(found);
-  const vms = [...asList(current.verificationMethod)];
-  const at = vms.findIndex((v) => absolute(idOf(v), found.docUrl) === vm.id);
-  if (at >= 0) vms[at] = vm;
-  else vms.push(vm);
-  const auth = [...asList(current.authentication)];
-  if (!auth.some((a) => absolute(idOf(a), found.docUrl) === vm.id)) auth.push(vm.id);
+  await putProfile(found, mergeMethod(current, found.docUrl, vm), etag);
+}
+
+async function putProfile(found, profile, etag) {
   const put = await session.authFetch(found.docUrl, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/ld+json', ...(etag ? { 'If-Match': etag } : {}) },
-    body: JSON.stringify({ ...current, verificationMethod: vms, authentication: auth }, null, 2),
+    body: JSON.stringify(profile, null, 2),
   });
   if (put.status === 412 || put.status === 409) throw new Error('The profile changed while doctor was working. Try again.');
   if (put.status === 401 || put.status === 403) throw new Error('The pod did not let this session write the profile. Are you signed in as its owner?');
@@ -277,22 +260,19 @@ async function writeMethod(found, vm) {
 
 // Reuse the method that already holds this key; otherwise take the first free #nostr-key-N.
 async function addKeyToProfile(found, pubkey) {
-  const { current } = await readLive(found);
-  const vms = asList(current.verificationMethod);
+  const { current, etag } = await readLive(found);
   const linked = linkedAs(current, found.docUrl, pubkey);
   if (linked) return { vmId: linked, existing: true };
-  for (const v of vms) {
-    const decoded = typeof v === 'object' && v?.publicKeyMultibase ? multikeyToNostrPubkey(v.publicKeyMultibase) : null;
-    if (decoded?.xOnlyHex !== pubkey) continue;
-    const vmId = absolute(idOf(v), found.docUrl);
-    await writeMethod(found, { ...v, id: vmId }); // known key, not yet usable for authentication
-    return { vmId, existing: false };
+  const known = methodFor(current, found.docUrl, pubkey);
+  if (known) {
+    // The key is there but not usable for authentication yet: add the reference.
+    const vm = asListed(current.verificationMethod).find((v) => absolute(idOf(v), found.docUrl) === known);
+    await putProfile(found, mergeMethod(current, found.docUrl, { ...vm, id: known }), etag);
+    return { vmId: known, existing: false };
   }
-  const taken = new Set(vms.map((v) => absolute(idOf(v), found.docUrl)));
-  let n = 1;
-  while (taken.has(`${found.docUrl}#nostr-key-${n}`)) n++;
-  const vm = buildNostrVerificationMethod({ webId: found.webId, xOnlyHex: pubkey, controller: found.controller, fragment: `nostr-key-${n}` });
-  await writeMethod(found, vm);
+  const id = freeFragment(current, found.docUrl, 'nostr-key');
+  const vm = buildNostrVerificationMethod({ webId: found.webId, xOnlyHex: pubkey, controller: found.controller, fragment: id.split('#')[1] });
+  await putProfile(found, mergeMethod(current, found.docUrl, vm), etag);
   return { vmId: vm.id, existing: false };
 }
 
@@ -361,7 +341,7 @@ el.jwtAdd.addEventListener('click', async () => {
     el.privkey.value = '';
     // Reuse the slot holding the same key; otherwise the first free lws-key-N.
     const { current } = await readLive(found);
-    const vms = asList(current.verificationMethod);
+    const vms = asListed(current.verificationMethod);
     const probe = lws.buildEs256kVerificationMethod({ privKey: memPrivKey, webId: found.webId, controller: found.controller, fragment: 'probe' }).jwk;
     let n = 1;
     for (;;) {
@@ -394,3 +374,50 @@ el.jwtTest.addEventListener('click', async () => {
     say('error', `Failed: ${err.message || err}`);
   }
 });
+
+// ---------- Advanced: keys in this profile, with removal ----------
+
+async function showKeys() {
+  el.keysList.innerHTML = '';
+  el.keysNote.textContent = '';
+  if (!session.isActive) {
+    el.keysNote.textContent = 'Sign in first (press "Connect my key" above, or "Check again").';
+    return;
+  }
+  const found = profileCache?.webId === session.webId ? profileCache : await findProfile(session.webId);
+  profileCache = found;
+  const { current } = await readLive(found);
+  const methods = nostrMethods(current, found.docUrl);
+  if (!methods.length) {
+    el.keysNote.textContent = 'No Nostr keys in this profile.';
+    return;
+  }
+  for (const m of methods) {
+    const li = document.createElement('li');
+    li.className = 'step pass';
+    li.innerHTML = '<span class="icon">🔑</span><div class="body"><div class="label"></div><div class="detail"></div></div><button type="button" class="secondary">Remove</button>';
+    li.querySelector('.label').textContent = `did:nostr:${m.pubkey}`;
+    li.querySelector('.detail').textContent = `${m.id}${m.authenticates ? '' : ' (not listed for authentication)'}`;
+    const button = li.querySelector('button');
+    let armed = false;
+    button.addEventListener('click', async () => {
+      if (!armed) {
+        armed = true;
+        button.textContent = 'Remove for good?';
+        return;
+      }
+      button.disabled = true;
+      try {
+        const { current: live, etag } = await readLive(found);
+        await putProfile(found, removeMethod(live, found.docUrl, m.id), etag);
+        await showKeys();
+        el.keysNote.textContent = `Removed ${m.id}. Apps signing with that key stop being you on this pod; pods that cache profiles may take a few minutes to notice.`;
+      } catch (err) {
+        el.keysNote.textContent = `Failed: ${err.message || err}`;
+        button.disabled = false;
+      }
+    });
+    el.keysList.appendChild(li);
+  }
+}
+el.keysRefresh.addEventListener('click', () => showKeys().catch((err) => (el.keysNote.textContent = `Failed: ${err.message || err}`)));

@@ -71,6 +71,14 @@
         <pre id="jwt-out" hidden></pre>
       </section>
 
+      <section id="keys">
+        <h2>Nostr keys in this profile</h2>
+        <p>Every key the pod accepts as you. Remove one you have lost or replaced; the pod then stops treating it as you.</p>
+        <button type="button" id="keys-refresh">Show keys</button>
+        <ol id="keys-list" class="steps"></ol>
+        <p class="hint" id="keys-note"></p>
+      </section>
+
       <section>
         <p class="hint">Signed in via Solid-OIDC as <code id="session-webid">nobody</code>.
           <button type="button" id="signout" class="link" hidden>Sign out</button></p>
